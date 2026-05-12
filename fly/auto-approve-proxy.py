@@ -4,15 +4,17 @@ Reverse proxy that sits in front of pr-agent.
 
 Forwards all webhook requests to pr-agent (upstream on port 3001), then checks
 whether the incoming event is an issue_comment from the pr-agent bot containing
-"No major issues detected". When it is, submits a formal GitHub PR approval via
-the GitHub App installation token.
+"No major issues detected". When it is, submits a formal GitHub PR approval.
 
-Environment variables (same as pr-agent, already set as Fly secrets):
-  GITHUB__APP_ID           GitHub App numeric ID
+Approval auth (checked in order):
+  GITHUB__BOT_PAT   Personal access token of a human account — approval counts
+                    toward branch protection required reviews. Recommended.
+  GITHUB__APP_ID +  Falls back to GitHub App installation token. Works but
+  GITHUB__PRIVATE_KEY  GitHub counts it as a bot approval, which may not satisfy
+                    branch protection rules.
+
+Other environment variables:
   GITHUB__WEBHOOK_SECRET   Used to verify incoming webhook signatures
-  GITHUB__PRIVATE_KEY      RSA private key (newlines as \\n or real newlines)
-
-Runtime:
   PORT          Port this proxy listens on  (default 3000)
   UPSTREAM_PORT Port pr-agent listens on   (default 3001)
 """
@@ -35,6 +37,7 @@ WEBHOOK_SECRET: bytes = _secret.encode() if _secret else b""
 
 APP_ID = os.environ.get("GITHUB__APP_ID", "")
 PRIVATE_KEY = os.environ.get("GITHUB__PRIVATE_KEY", "").replace("\\n", "\n")
+BOT_PAT = os.environ.get("GITHUB__BOT_PAT", "")
 
 APPROVAL_TRIGGER = "No major issues detected"
 
@@ -69,7 +72,7 @@ def _get_installation_token(installation_id: int) -> str:
 
 def _approve_pr(owner: str, repo: str, pull_number: int, installation_id: int) -> None:
     try:
-        token = _get_installation_token(installation_id)
+        token = BOT_PAT if BOT_PAT else _get_installation_token(installation_id)
         body = json.dumps(
             {"event": "APPROVE", "body": "Auto-approved: pr-agent found no major issues. ✅"}
         ).encode()
