@@ -1,0 +1,15 @@
+# Global pr-agent config — copy this file to klikpeta-tech/.github as .pr_agent.toml
+# Applies to ALL repos in the org automatically.
+# Docs: https://pr-agent-docs.codium.ai/usage-guide/configuration_options/
+
+[config]
+language = "en-us"
+
+[pr_description]
+publish_labels = true
+generate_ai_title = true
+
+[pr_reviewer]
+num_code_suggestions = 4
+enable_review_labels_security = true
+require_score_label = false

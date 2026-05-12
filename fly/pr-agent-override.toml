@@ -1,0 +1,32 @@
+[config]
+model = "gpt-5.4-2026-03-05"
+model_weak = "gpt-4.1-mini"
+fallback_models = ["gpt-4.1-mini"]
+deployment_type = "app"
+
+[github_app]
+# Auto-run on PR open/reopen/ready
+handle_pr_actions = ['opened', 'reopened', 'ready_for_review']
+pr_commands = ["/describe", "/review", "/improve"]
+# Auto-run on new commits pushed to an open PR
+handle_push_trigger = true
+push_trigger_wait_for_initial_review = true
+push_trigger_pending_tasks_backlog = true
+push_commands = ["/review", "/improve"]
+
+[pr_reviewer]
+persistent_comment = true
+num_max_findings = 3
+enable_review_labels_security = true
+enable_review_labels_effort = true
+
+[pr_description]
+publish_labels = true
+generate_ai_title = true
+add_original_user_description = true
+enable_semantic_files_types = true
+
+[pr_code_suggestions]
+persistent_comment = true
+focus_only_on_problems = true
+num_code_suggestions_per_chunk = 3
