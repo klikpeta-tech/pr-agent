@@ -171,6 +171,12 @@ def _request_changes_and_add_reviewer(
                         f" HTTP {exc.code} {detail}",
                         flush=True,
                     )
+            except Exception as exc:
+                # Catch network/timeout errors so REQUEST_CHANGES still runs below.
+                print(
+                    f"[auto-action] ❌ Failed to add reviewer on PR #{pull_number}: {exc}",
+                    flush=True,
+                )
         elif REVIEWER_USERNAME and REVIEWER_USERNAME == pr_author:
             print(
                 f"[auto-action] ⏭️  Skipping reviewer assignment — {pr_author} is the PR author",
