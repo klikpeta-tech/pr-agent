@@ -9,12 +9,10 @@ the review result:
   - Issues detected (pr-agent review comment without the above phrase) →
     submits REQUEST_CHANGES and adds REVIEWER_USERNAME as a requested reviewer.
 
-Auth (checked in order):
-  GITHUB__BOT_PAT   Personal access token of a human account — review actions
-                    count toward branch protection required reviews. Recommended.
-  GITHUB__APP_ID +  Falls back to GitHub App installation token. Works but
-  GITHUB__PRIVATE_KEY  GitHub counts it as a bot review, which may not satisfy
-                    branch protection rules.
+Auth:
+  All review actions (approve, request changes, add reviewer) use the GitHub
+  App installation token. The App must have contents:write permission so its
+  reviews count toward branch protection required approvals.
 
 Other environment variables:
   GITHUB__WEBHOOK_SECRET   Used to verify incoming webhook signatures
@@ -83,7 +81,7 @@ def _get_installation_token(installation_id: int) -> str:
 
 def _approve_pr(owner: str, repo: str, pull_number: int, installation_id: int) -> None:
     try:
-        token = BOT_PAT if BOT_PAT else _get_installation_token(installation_id)
+        token = _get_installation_token(installation_id)
         body = json.dumps(
             {"event": "APPROVE", "body": "Auto-approved: pr-agent found no major issues. ✅"}
         ).encode()
@@ -123,21 +121,12 @@ def _request_changes_and_add_reviewer(
     owner: str, repo: str, pull_number: int, installation_id: int, pr_author: str
 ) -> None:
     try:
-        # Use App installation token for REQUEST_CHANGES — BOT_PAT belongs to a
-        # human who may be the PR author, and GitHub blocks self-reviews.
-        bot_token = _get_installation_token(installation_id)
-        bot_headers = {
-            "Authorization": f"Bearer {bot_token}",
+        token = _get_installation_token(installation_id)
+        gh_headers = {
+            "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",
             "Content-Type": "application/json",
             "X-GitHub-Api-Version": "2022-11-28",
-        }
-
-        # BOT_PAT is a human token — use it only for the reviewer-assignment call
-        # (bots can't always add human reviewers via the App token).
-        pat_headers = {
-            **bot_headers,
-            "Authorization": f"Bearer {BOT_PAT}" if BOT_PAT else bot_headers["Authorization"],
         }
 
         # 1. Add reviewer — skip if unset or if reviewer is the PR author
@@ -147,7 +136,7 @@ def _request_changes_and_add_reviewer(
                 f"https://api.github.com/repos/{owner}/{repo}/pulls/{pull_number}/requested_reviewers",
                 data=reviewer_body,
                 method="POST",
-                headers=pat_headers,
+                headers=gh_headers,
             )
             try:
                 with urllib.request.urlopen(req, timeout=15):
@@ -183,8 +172,7 @@ def _request_changes_and_add_reviewer(
                 flush=True,
             )
 
-        # 2. Request changes — submitted by the bot (App token) so the PR author
-        #    doesn't block themselves with their own token.
+        # 2. Request changes
         review_body = json.dumps(
             {"event": "REQUEST_CHANGES", "body": "pr-agent found issues — review required. ⚠️"}
         ).encode()
@@ -192,7 +180,7 @@ def _request_changes_and_add_reviewer(
             f"https://api.github.com/repos/{owner}/{repo}/pulls/{pull_number}/reviews",
             data=review_body,
             method="POST",
-            headers=bot_headers,
+            headers=gh_headers,
         )
         try:
             with urllib.request.urlopen(req, timeout=15):
