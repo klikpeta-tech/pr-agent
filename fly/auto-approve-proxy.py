@@ -18,6 +18,8 @@ Auth (checked in order):
 
 Other environment variables:
   GITHUB__WEBHOOK_SECRET   Used to verify incoming webhook signatures
+  PR_AGENT_BOT_LOGIN       Exact GitHub login of the pr-agent bot (default: klikpeta-pr-agent[bot])
+  REVIEWER_USERNAME        GitHub login to assign as reviewer when issues are found (default: mfhanif)
   PORT          Port this proxy listens on  (default 3000)
   UPSTREAM_PORT Port pr-agent listens on   (default 3001)
 """
@@ -46,7 +48,9 @@ APPROVAL_TRIGGER = "No major issues detected"
 # pr-agent review comments always contain this header; guards against acting on
 # /describe or /improve bot comments.
 REVIEW_COMMENT_MARKER = "PR Reviewer Guide"
-REVIEWER_USERNAME = "mfhanif"
+# Pin to the exact bot login so a different GitHub App can't spoof the trigger.
+PR_AGENT_BOT_LOGIN = os.environ.get("PR_AGENT_BOT_LOGIN", "klikpeta-pr-agent[bot]")
+REVIEWER_USERNAME = os.environ.get("REVIEWER_USERNAME", "mfhanif")
 
 
 # ── JWT / GitHub token helpers ────────────────────────────────────────────────
@@ -209,9 +213,9 @@ def _maybe_auto_action(event_type: str, payload: dict) -> None:
     if "pull_request" not in issue:
         return
 
-    # Must be from a bot account (ends with [bot])
+    # Must be the exact pr-agent bot identity (not just any [bot] account)
     sender_login: str = comment.get("user", {}).get("login", "")
-    if not sender_login.endswith("[bot]"):
+    if sender_login != PR_AGENT_BOT_LOGIN:
         return
 
     body: str = comment.get("body", "")
