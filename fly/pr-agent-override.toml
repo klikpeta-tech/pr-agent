@@ -1,5 +1,5 @@
 [config]
-model = "gpt-5.4-2026-03-05"
+model = "gpt-4.1-mini"
 model_weak = "gpt-4.1-mini"
 fallback_models = ["gpt-4.1-mini"]
 deployment_type = "app"
