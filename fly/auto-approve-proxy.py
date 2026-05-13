@@ -48,7 +48,7 @@ APPROVAL_TRIGGER = "No major issues detected"
 REVIEW_COMMENT_MARKER = "PR Reviewer Guide"
 # Pin to the exact bot login so a different GitHub App can't spoof the trigger.
 PR_AGENT_BOT_LOGIN = os.environ.get("PR_AGENT_BOT_LOGIN", "klikpeta-pr-agent[bot]")
-REVIEWER_USERNAME = os.environ.get("REVIEWER_USERNAME", "mfhanif")
+REVIEWER_USERNAME = os.environ.get("REVIEWER_USERNAME", "")
 
 
 # ── JWT / GitHub token helpers ────────────────────────────────────────────────
