@@ -131,36 +131,37 @@ def _request_changes_and_add_reviewer(
             "X-GitHub-Api-Version": "2022-11-28",
         }
 
-        # 1. Add reviewer
-        reviewer_body = json.dumps({"reviewers": [REVIEWER_USERNAME]}).encode()
-        req = urllib.request.Request(
-            f"https://api.github.com/repos/{owner}/{repo}/pulls/{pull_number}/requested_reviewers",
-            data=reviewer_body,
-            method="POST",
-            headers=gh_headers,
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=15):
-                pass
-            print(
-                f"[auto-action] 👤 Added {REVIEWER_USERNAME} as reviewer on PR #{pull_number}"
-                f" in {owner}/{repo}",
-                flush=True,
+        # 1. Add reviewer (skipped if REVIEWER_USERNAME is unset)
+        if REVIEWER_USERNAME:
+            reviewer_body = json.dumps({"reviewers": [REVIEWER_USERNAME]}).encode()
+            req = urllib.request.Request(
+                f"https://api.github.com/repos/{owner}/{repo}/pulls/{pull_number}/requested_reviewers",
+                data=reviewer_body,
+                method="POST",
+                headers=gh_headers,
             )
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode(errors="replace")
-            if exc.code == 422:
+            try:
+                with urllib.request.urlopen(req, timeout=15):
+                    pass
                 print(
-                    f"[auto-action] ⚠️  Could not add reviewer on PR #{pull_number}"
-                    f" (HTTP 422 — already added or is PR author): {detail}",
+                    f"[auto-action] 👤 Added {REVIEWER_USERNAME} as reviewer on PR #{pull_number}"
+                    f" in {owner}/{repo}",
                     flush=True,
                 )
-            else:
-                print(
-                    f"[auto-action] ❌ Failed to add reviewer on PR #{pull_number}:"
-                    f" HTTP {exc.code} {detail}",
-                    flush=True,
-                )
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode(errors="replace")
+                if exc.code == 422:
+                    print(
+                        f"[auto-action] ⚠️  Could not add reviewer on PR #{pull_number}"
+                        f" (HTTP 422 — already added or is PR author): {detail}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[auto-action] ❌ Failed to add reviewer on PR #{pull_number}:"
+                        f" HTTP {exc.code} {detail}",
+                        flush=True,
+                    )
 
         # 2. Request changes
         review_body = json.dumps(
