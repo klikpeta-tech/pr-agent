@@ -120,25 +120,34 @@ def _approve_pr(owner: str, repo: str, pull_number: int, installation_id: int) -
 
 
 def _request_changes_and_add_reviewer(
-    owner: str, repo: str, pull_number: int, installation_id: int
+    owner: str, repo: str, pull_number: int, installation_id: int, pr_author: str
 ) -> None:
     try:
-        token = BOT_PAT if BOT_PAT else _get_installation_token(installation_id)
-        gh_headers = {
-            "Authorization": f"Bearer {token}",
+        # Use App installation token for REQUEST_CHANGES — BOT_PAT belongs to a
+        # human who may be the PR author, and GitHub blocks self-reviews.
+        bot_token = _get_installation_token(installation_id)
+        bot_headers = {
+            "Authorization": f"Bearer {bot_token}",
             "Accept": "application/vnd.github+json",
             "Content-Type": "application/json",
             "X-GitHub-Api-Version": "2022-11-28",
         }
 
-        # 1. Add reviewer (skipped if REVIEWER_USERNAME is unset)
-        if REVIEWER_USERNAME:
+        # BOT_PAT is a human token — use it only for the reviewer-assignment call
+        # (bots can't always add human reviewers via the App token).
+        pat_headers = {
+            **bot_headers,
+            "Authorization": f"Bearer {BOT_PAT}" if BOT_PAT else bot_headers["Authorization"],
+        }
+
+        # 1. Add reviewer — skip if unset or if reviewer is the PR author
+        if REVIEWER_USERNAME and REVIEWER_USERNAME != pr_author:
             reviewer_body = json.dumps({"reviewers": [REVIEWER_USERNAME]}).encode()
             req = urllib.request.Request(
                 f"https://api.github.com/repos/{owner}/{repo}/pulls/{pull_number}/requested_reviewers",
                 data=reviewer_body,
                 method="POST",
-                headers=gh_headers,
+                headers=pat_headers,
             )
             try:
                 with urllib.request.urlopen(req, timeout=15):
@@ -153,7 +162,7 @@ def _request_changes_and_add_reviewer(
                 if exc.code == 422:
                     print(
                         f"[auto-action] ⚠️  Could not add reviewer on PR #{pull_number}"
-                        f" (HTTP 422 — already added or is PR author): {detail}",
+                        f" (HTTP 422 — already added): {detail}",
                         flush=True,
                     )
                 else:
@@ -162,8 +171,14 @@ def _request_changes_and_add_reviewer(
                         f" HTTP {exc.code} {detail}",
                         flush=True,
                     )
+        elif REVIEWER_USERNAME and REVIEWER_USERNAME == pr_author:
+            print(
+                f"[auto-action] ⏭️  Skipping reviewer assignment — {pr_author} is the PR author",
+                flush=True,
+            )
 
-        # 2. Request changes
+        # 2. Request changes — submitted by the bot (App token) so the PR author
+        #    doesn't block themselves with their own token.
         review_body = json.dumps(
             {"event": "REQUEST_CHANGES", "body": "pr-agent found issues — review required. ⚠️"}
         ).encode()
@@ -171,7 +186,7 @@ def _request_changes_and_add_reviewer(
             f"https://api.github.com/repos/{owner}/{repo}/pulls/{pull_number}/reviews",
             data=review_body,
             method="POST",
-            headers=gh_headers,
+            headers=bot_headers,
         )
         try:
             with urllib.request.urlopen(req, timeout=15):
@@ -229,6 +244,7 @@ def _maybe_auto_action(event_type: str, payload: dict) -> None:
     repo_name = repo.get("name", "")
     pull_number = issue.get("number")
     installation_id = installation.get("id")
+    pr_author: str = issue.get("user", {}).get("login", "")
 
     if not all([owner, repo_name, pull_number, installation_id]):
         print("[auto-action] Missing required fields in payload, skipping.", flush=True)
@@ -248,12 +264,12 @@ def _maybe_auto_action(event_type: str, payload: dict) -> None:
     else:
         print(
             f"[auto-action] Issues detected on PR #{pull_number} in {owner}/{repo_name}"
-            f" (comment by {sender_login})",
+            f" (comment by {sender_login}, author {pr_author})",
             flush=True,
         )
         threading.Thread(
             target=_request_changes_and_add_reviewer,
-            args=(owner, repo_name, pull_number, installation_id),
+            args=(owner, repo_name, pull_number, installation_id, pr_author),
             daemon=True,
         ).start()
 
