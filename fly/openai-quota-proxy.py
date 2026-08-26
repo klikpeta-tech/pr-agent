@@ -253,17 +253,23 @@ class QuotaState:
         with self._lock:
             self._roll_day_locked()
 
+            def fits(t: int) -> bool:
+                # The reservation itself has to fit, not just the balance so far;
+                # otherwise one big request slips through right at the boundary
+                # and spends past the cap.
+                return self._committed_locked(t) + estimate <= TIER_SPENDABLE[t]
+
             if tier == 1:
-                if self._committed_locked(1) < TIER_SPENDABLE[1]:
+                if fits(1):
                     self._reserved[1] += estimate
                     return requested, 1, "as_is", estimate
                 target = DOWNGRADE.get(normalize_model(requested), DEFAULT_TIER2_MODEL)
-                if self._committed_locked(2) < TIER_SPENDABLE[2]:
+                if fits(2):
                     self._reserved[2] += estimate
                     return target, 2, "downgraded", estimate
                 return target, 2, "exhausted", 0
 
-            if self._committed_locked(2) < TIER_SPENDABLE[2]:
+            if fits(2):
                 self._reserved[2] += estimate
                 return requested, 2, "as_is", estimate
             return requested, 2, "exhausted", 0
@@ -316,6 +322,33 @@ def _usage_line() -> str:
         return f"tier{n} {used:,}/{spendable:,} ({pct(used, spendable)}){extra}"
 
     return f"{tier(1)} | {tier(2)}"
+
+
+def extract_stream_tokens(raw: bytes) -> int:
+    """Read a token count out of a buffered SSE (streaming) response body.
+
+    Streamed replies only carry usage when the request asked for
+    `stream_options: {"include_usage": true}`, and only in the final chunk.
+    pr-agent streams for STREAMING_REQUIRED_MODELS only (currently just
+    openai/qwq-plus) and can be made to stream by force_streaming_* settings, so
+    nothing here streams today — but an unparsed stream would meter as zero,
+    which is a silent metering hole in the direction that costs money.
+    """
+    total = 0
+    for line in raw.split(b"\n"):
+        line = line.strip()
+        if not line.startswith(b"data:"):
+            continue
+        payload = line[5:].strip()
+        if not payload or payload == b"[DONE]":
+            continue
+        try:
+            chunk = json.loads(payload)
+        except Exception:
+            continue
+        # Only the final chunk carries usage, and it covers the whole request.
+        total = max(total, extract_total_tokens(chunk))
+    return total
 
 
 def extract_total_tokens(payload: dict) -> int:
@@ -410,8 +443,24 @@ class _QuotaHandler(http.server.BaseHTTPRequestHandler):
         self._relay(status, body, headers)
 
     def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length) if length else b""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            # Reply rather than raising, which would drop the connection with no
+            # status line at all.
+            self._reply(
+                400,
+                json.dumps(
+                    {
+                        "error": {
+                            "message": "openai-quota-proxy: invalid Content-Length",
+                            "type": "invalid_request_error",
+                        }
+                    }
+                ).encode(),
+            )
+            return
+        body = self.rfile.read(length) if length > 0 else b""
 
         if not any(self.path.endswith(p) for p in COMPLETION_PATHS):
             status, resp_body, headers = self._forward("POST", body)
@@ -465,12 +514,29 @@ class _QuotaHandler(http.server.BaseHTTPRequestHandler):
         try:
             status, resp_body, headers = self._forward("POST", body)
             if status == 200:
-                try:
-                    tokens = extract_total_tokens(json.loads(resp_body))
-                except Exception:
-                    tokens = 0
+                content_type = next(
+                    (v for k, v in headers if k.lower() == "content-type"), ""
+                )
+                streamed = "text/event-stream" in content_type.lower()
+                if streamed:
+                    tokens = extract_stream_tokens(resp_body)
+                else:
+                    try:
+                        tokens = extract_total_tokens(json.loads(resp_body))
+                    except Exception:
+                        tokens = 0
+
                 if tokens:
                     print(f"[quota] {model} used {tokens:,} tokens", flush=True)
+                elif streamed:
+                    # Spell this out: the tokens were really spent, we just can't
+                    # see them, so the day's counters now understate real usage.
+                    print(
+                        f"[quota] ⚠️  {model} streamed a response with no usage chunk —"
+                        " NOT metered. Set stream_options.include_usage on streaming"
+                        " requests, or quota enforcement will drift.",
+                        flush=True,
+                    )
                 else:
                     print(
                         f"[quota] ⚠️  No usage reported for {model}; counters unchanged.",

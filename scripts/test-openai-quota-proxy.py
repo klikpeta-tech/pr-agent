@@ -32,6 +32,8 @@ TIER2_BUDGET = 2000
 # Mutated by individual cases to slow the upstream down or force a failure.
 RESPONSE_DELAY = 0.0
 FORCE_STATUS: int | None = None
+# "usage" -> SSE ending in a usage chunk; "nousage" -> SSE without one.
+FORCE_STREAM: str | None = None
 
 seen_models: list[str] = []
 seen_auth: list[str] = []
@@ -73,6 +75,22 @@ class FakeOpenAI(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(err)))
             self.end_headers()
             self.wfile.write(err)
+            return
+        if FORCE_STREAM:
+            chunks = [
+                {"choices": [{"delta": {"content": "ok"}, "index": 0}], "usage": None},
+            ]
+            if FORCE_STREAM == "usage":
+                chunks.append(
+                    {"choices": [], "usage": {"total_tokens": TOKENS_PER_CALL}}
+                )
+            sse = b"".join(f"data: {json.dumps(c)}\n\n".encode() for c in chunks)
+            sse += b"data: [DONE]\n\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(sse)))
+            self.end_headers()
+            self.wfile.write(sse)
             return
         body = json.dumps(
             {
@@ -119,6 +137,10 @@ def main() -> int:
             "TIER1_DAILY_TOKENS": str(TIER1_BUDGET),
             "TIER2_DAILY_TOKENS": str(TIER2_BUDGET),
             "QUOTA_HEADROOM": "1.0",
+            # Small reservations so the tiny budgets here behave predictably; the
+            # production defaults would exceed a 1000-token test budget outright.
+            "QUOTA_RESERVE_MIN": "0",
+            "QUOTA_RESERVE_COMPLETION": "100",
             **(extra_env or {}),
         }
         # Drop inherited preseed vars so each case controls its own.
@@ -140,7 +162,16 @@ def main() -> int:
                 return proc
             except Exception:
                 time.sleep(0.1)
-        raise RuntimeError(f"proxy did not start: {proc.stdout.read() if proc.stdout else ''}")
+        # Terminate before reading: if the process is alive but never became
+        # ready, an unbounded read() on its still-open stdout would hang the
+        # suite instead of failing it.
+        proc.terminate()
+        try:
+            out, _ = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, _ = proc.communicate()
+        raise RuntimeError(f"proxy did not start: {out}")
 
     def call(model="gpt-5.4-2026-03-05"):
         req = urllib.request.Request(
@@ -154,11 +185,18 @@ def main() -> int:
             },
             method="POST",
         )
+        def parse(raw: bytes):
+            # SSE bodies aren't JSON; hand those back as text.
+            try:
+                return json.loads(raw)
+            except ValueError:
+                return raw.decode(errors="replace")
+
         try:
             with urllib.request.urlopen(req, timeout=15) as r:
-                return r.status, json.loads(r.read())
+                return r.status, parse(r.read())
         except urllib.error.HTTPError as e:
-            return e.code, json.loads(e.read())
+            return e.code, parse(e.read())
 
     def quota():
         with urllib.request.urlopen(f"http://127.0.0.1:{proxy_port}/__quota", timeout=5) as r:
@@ -300,8 +338,16 @@ def main() -> int:
         rm_state()
         seen_models.clear()
         RESPONSE_DELAY = 1.0  # hold every call open so all 12 overlap
+        # Pin the reservation to exactly 2500 so admissions are arithmetic:
+        # admit while committed + 2500 <= 10000, i.e. at 0/2500/5000/7500.
         proc = start_proxy(
-            {"TIER1_DAILY_TOKENS": "10000", "TIER2_DAILY_TOKENS": "1000000", "QUOTA_HEADROOM": "1.0"}
+            {
+                "TIER1_DAILY_TOKENS": "10000",
+                "TIER2_DAILY_TOKENS": "1000000",
+                "QUOTA_HEADROOM": "1.0",
+                "QUOTA_RESERVE_MIN": "2500",
+                "QUOTA_RESERVE_COMPLETION": "0",
+            }
         )
         results: list[int] = []
         threads = [
@@ -316,17 +362,34 @@ def main() -> int:
         snap = quota()
         tier1_calls = sum(1 for m in seen_models if m == "gpt-5.4-2026-03-05")
         tier2_calls = sum(1 for m in seen_models if m == "gpt-5.4-mini")
-        # estimate = max(2000, len(body)//4 + 4000) ~= 4019, so exactly 3 fit in
-        # a 10000 budget (reserved at 0, 4019, 8038; the 4th sees 12057).
         check("all 12 requests answered", len(results), 12)
         check("none rejected", [r for r in results if r != 200], [])
-        check("only 3 admitted to tier1", tier1_calls, 3)
-        check("the rest downgraded to tier2", tier2_calls, 9)
-        check("tier1 spend stayed under budget", snap["tier1_used"] <= 10000, True)
-        check("tier1 used exactly 3 calls' worth", snap["tier1_used"], 3 * TOKENS_PER_CALL)
-        check("tier2 charged the other 9", snap["tier2_used"], 9 * TOKENS_PER_CALL)
+        check("only 4 admitted to tier1", tier1_calls, 4)
+        check("the rest downgraded to tier2", tier2_calls, 8)
+        check("tier1 reservations never exceeded budget", snap["tier1_used"] <= 10000, True)
+        check("tier1 used exactly 4 calls' worth", snap["tier1_used"], 4 * TOKENS_PER_CALL)
+        check("tier2 charged the other 8", snap["tier2_used"], 8 * TOKENS_PER_CALL)
         check("tier1 reservations all released", snap["tier1_reserved"], 0)
         check("tier2 reservations all released", snap["tier2_reserved"], 0)
+
+        print("\n=== a reservation too big for the tier is not admitted ===")
+        proc.terminate(); proc.wait(timeout=10)
+        rm_state()
+        seen_models.clear()
+        # One request whose estimate alone exceeds the tier-1 budget must not be
+        # sent on tier 1 just because the balance is still zero.
+        proc = start_proxy(
+            {
+                "TIER1_DAILY_TOKENS": "5000",
+                "TIER2_DAILY_TOKENS": "1000000",
+                "QUOTA_HEADROOM": "1.0",
+                "QUOTA_RESERVE_MIN": "9000",
+                "QUOTA_RESERVE_COMPLETION": "0",
+            }
+        )
+        status, _ = call()
+        check("oversized request downgraded, not admitted", seen_models[-1], "gpt-5.4-mini")
+        check("tier1 untouched", quota()["tier1_used"], 0)
 
         print("\n=== failed upstream call releases its reservation ===")
         global FORCE_STATUS
@@ -343,6 +406,48 @@ def main() -> int:
         # Budget must be fully usable again after the failure.
         status, _ = call()
         check("next call still admitted to tier1", seen_models[-1], "gpt-5.4-2026-03-05")
+
+        print("\n=== streamed response is still metered ===")
+        global FORCE_STREAM
+        proc.terminate(); proc.wait(timeout=10)
+        rm_state()
+        proc = start_proxy()
+        FORCE_STREAM = "usage"
+        status, _ = call()
+        FORCE_STREAM = None
+        snap = quota()
+        check("stream relayed", status, 200)
+        check("usage chunk metered", snap["tier1_used"], TOKENS_PER_CALL)
+        check("no reservation left held", snap["tier1_reserved"], 0)
+
+        print("\n=== stream with no usage chunk: unmetered but released ===")
+        proc.terminate(); proc.wait(timeout=10)
+        rm_state()
+        proc = start_proxy()
+        FORCE_STREAM = "nousage"
+        status, _ = call()
+        FORCE_STREAM = None
+        snap = quota()
+        check("stream relayed", status, 200)
+        check("nothing metered (cannot see usage)", snap["tier1_used"], 0)
+        check("reservation still released", snap["tier1_reserved"], 0)
+
+        print("\n=== malformed Content-Length answers 400, not a dropped socket ===")
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{proxy_port}/v1/chat/completions",
+            data=b'{"model": "gpt-5.4-2026-03-05"}',
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        req.add_header("Content-Length", "not-a-number")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                bad_status = r.status
+        except urllib.error.HTTPError as e:
+            bad_status = e.code
+        except Exception as exc:  # a dropped connection would land here
+            bad_status = f"raised {type(exc).__name__}"
+        check("malformed header gets a status code", bad_status, 400)
 
         print("\n=== unreachable upstream answers 503, not a dropped connection ===")
         proc.terminate(); proc.wait(timeout=10)
