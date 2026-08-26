@@ -58,7 +58,11 @@ Two non-obvious reasons it works this way:
 - **pr-agent's `fallback_models` cannot do this job.** Overage isn't refused by OpenAI, it's billed — so the primary model keeps returning 200 and no fallback ever fires.
 - **An org-level enforced spend limit cannot either.** It's all-or-nothing: once tripped, *every* model 429s at once, so falling back to a mini model fails as well. (This is what took the app fully down on 2026-07-31.) Keep a small non-zero spend limit as a backstop against bugs in the proxy's own counting — just don't rely on it to pick models.
 
-Counters live in a JSON file (`QUOTA_STATE_PATH`, default `/tmp/openai-quota-state.json`). There is no Fly volume, so the file survives suspend/resume and stop/start of the machine but resets on `fly deploy` — a fresh deploy re-grants a full tier-1 budget the proxy hasn't actually spent. `QUOTA_HEADROOM` (default `0.90`) leaves slack for the request that crosses a budget line, since token cost is only known after the response. Tune budgets/headroom with the env vars documented at the top of `fly/openai-quota-proxy.py`.
+Counters live in a JSON file on the `pr_agent_data` Fly volume, mounted at `/data` and pointed at by `QUOTA_STATE_PATH` in `fly.pr-agent.toml`. The volume is what makes the counters survive `fly deploy` — in `/tmp` (the code's default, still used for local runs) they reset on every image change, handing the proxy a full tier-1 budget it hasn't actually spent. Note that attaching the volume pins the app to one machine in `sin`, and adding or removing the mount replaces the machine rather than updating it in place.
+
+Budget is checked against `used + reserved`: a request reserves an estimated cost (prompt length plus the completion cap) while in flight and settles to actual usage afterwards, so parallel requests can't each be told the same budget is free. `QUOTA_HEADROOM` (default `0.90`) is a second margin on top, since a response can still cost more than its estimate. Tune budgets, headroom, and reservation sizing with the env vars documented at the top of `fly/openai-quota-proxy.py`.
+
+One known gap: a streamed response only carries token usage when the request sets `stream_options.include_usage`. pr-agent only streams for `STREAMING_REQUIRED_MODELS` (currently just `openai/qwq-plus`), so nothing streams today, but if that changes the proxy logs a loud "NOT metered" warning rather than silently undercounting.
 
 Current usage is logged to stdout on every call (`fly logs`), and served as JSON from `http://127.0.0.1:3002/__quota` inside the machine.
 
