@@ -302,6 +302,17 @@ class _ProxyHandler(http.server.BaseHTTPRequestHandler):
                 return resp.status, resp.read()
         except urllib.error.HTTPError as exc:
             return exc.code, exc.read()
+        except (urllib.error.URLError, OSError) as exc:
+            # Connection refused means pr-agent isn't listening yet (or has died);
+            # OSError also covers read timeouts. Reply 503 instead of letting the
+            # handler raise, which would dump a traceback and drop the connection.
+            reason = getattr(exc, "reason", exc)
+            print(
+                f"[proxy] ❌ upstream :{UPSTREAM_PORT} unreachable for {method} {self.path}"
+                f" ({reason})",
+                flush=True,
+            )
+            return 503, b'{"error": "pr-agent upstream unavailable"}'
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))

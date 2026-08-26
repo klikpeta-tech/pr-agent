@@ -1,8 +1,14 @@
 [config]
 model = "gpt-5.4-2026-03-05"
 model_weak = "gpt-4.1-mini"
-fallback_models = ["gpt-4.1-mini"]
+fallback_models = ["gpt-5.4-mini"]
 deployment_type = "app"
+
+[openai]
+# All OpenAI traffic goes through the local quota proxy (fly/openai-quota-proxy.py),
+# which meters the daily free-tier grant and rewrites `model` to the tier-2
+# equivalent once the tier-1 budget is spent. Bypassing it risks paid usage.
+api_base = "http://127.0.0.1:3002/v1"
 
 [github_app]
 # Auto-run on PR open/reopen/ready
