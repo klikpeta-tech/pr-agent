@@ -29,6 +29,10 @@ TOKENS_PER_CALL = 400
 TIER1_BUDGET = 1000
 TIER2_BUDGET = 2000
 
+# Mutated by individual cases to slow the upstream down or force a failure.
+RESPONSE_DELAY = 0.0
+FORCE_STATUS: int | None = None
+
 seen_models: list[str] = []
 seen_auth: list[str] = []
 failures: list[str] = []
@@ -60,6 +64,16 @@ class FakeOpenAI(http.server.BaseHTTPRequestHandler):
         req = json.loads(self.rfile.read(n))
         seen_models.append(req.get("model"))
         seen_auth.append(self.headers.get("Authorization"))
+        if RESPONSE_DELAY:
+            time.sleep(RESPONSE_DELAY)
+        if FORCE_STATUS:
+            err = json.dumps({"error": {"message": "forced failure"}}).encode()
+            self.send_response(FORCE_STATUS)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(err)))
+            self.end_headers()
+            self.wfile.write(err)
+            return
         body = json.dumps(
             {
                 "id": "chatcmpl-fake",
@@ -273,6 +287,74 @@ def main() -> int:
         proc.terminate(); proc.wait(timeout=10)
         proc = start_proxy({"QUOTA_PRESEED_DAY": today, "QUOTA_PRESEED_TIER1": "999"})
         check("saved state wins", quota()["tier1_used"], 400)
+
+        # A request reserves its estimated cost while in flight, so parallel
+        # requests can't each be told the same budget is free. Before that, the
+        # budget was only charged after a response arrived, so all 12 below would
+        # read used=0 and be admitted to tier 1 — the check was simply inert
+        # under concurrency, and a burst of costlier calls could overshoot the
+        # cap into billable usage. This is the race pr-agent flagged on PR #2.
+        print("\n=== concurrent requests cannot collectively overshoot ===")
+        global RESPONSE_DELAY
+        proc.terminate(); proc.wait(timeout=10)
+        rm_state()
+        seen_models.clear()
+        RESPONSE_DELAY = 1.0  # hold every call open so all 12 overlap
+        proc = start_proxy(
+            {"TIER1_DAILY_TOKENS": "10000", "TIER2_DAILY_TOKENS": "1000000", "QUOTA_HEADROOM": "1.0"}
+        )
+        results: list[int] = []
+        threads = [
+            threading.Thread(target=lambda: results.append(call()[0])) for _ in range(12)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+        RESPONSE_DELAY = 0.0
+
+        snap = quota()
+        tier1_calls = sum(1 for m in seen_models if m == "gpt-5.4-2026-03-05")
+        tier2_calls = sum(1 for m in seen_models if m == "gpt-5.4-mini")
+        # estimate = max(2000, len(body)//4 + 4000) ~= 4019, so exactly 3 fit in
+        # a 10000 budget (reserved at 0, 4019, 8038; the 4th sees 12057).
+        check("all 12 requests answered", len(results), 12)
+        check("none rejected", [r for r in results if r != 200], [])
+        check("only 3 admitted to tier1", tier1_calls, 3)
+        check("the rest downgraded to tier2", tier2_calls, 9)
+        check("tier1 spend stayed under budget", snap["tier1_used"] <= 10000, True)
+        check("tier1 used exactly 3 calls' worth", snap["tier1_used"], 3 * TOKENS_PER_CALL)
+        check("tier2 charged the other 9", snap["tier2_used"], 9 * TOKENS_PER_CALL)
+        check("tier1 reservations all released", snap["tier1_reserved"], 0)
+        check("tier2 reservations all released", snap["tier2_reserved"], 0)
+
+        print("\n=== failed upstream call releases its reservation ===")
+        global FORCE_STATUS
+        proc.terminate(); proc.wait(timeout=10)
+        rm_state()
+        proc = start_proxy()
+        FORCE_STATUS = 500
+        status, _ = call()
+        FORCE_STATUS = None
+        snap = quota()
+        check("error relayed to caller", status, 500)
+        check("nothing metered for a failed call", snap["tier1_used"], 0)
+        check("reservation released, not leaked", snap["tier1_reserved"], 0)
+        # Budget must be fully usable again after the failure.
+        status, _ = call()
+        check("next call still admitted to tier1", seen_models[-1], "gpt-5.4-2026-03-05")
+
+        print("\n=== unreachable upstream answers 503, not a dropped connection ===")
+        proc.terminate(); proc.wait(timeout=10)
+        rm_state()
+        dead_port = free_port()  # nothing is listening here
+        proc = start_proxy({"OPENAI_UPSTREAM_BASE": f"http://127.0.0.1:{dead_port}"})
+        status, resp = call()
+        check("got a real status code", status, 503)
+        check("error code identifies the cause", resp["error"]["code"], "upstream_unreachable")
+        snap = quota()
+        check("nothing metered", snap["tier1_used"], 0)
+        check("reservation released", snap["tier1_reserved"], 0)
     finally:
         proc.terminate()
         try:

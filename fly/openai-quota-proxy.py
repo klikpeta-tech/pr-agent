@@ -76,6 +76,13 @@ PRESEED = {
 # line — without it a single large diff could overshoot into paid usage.
 HEADROOM = float(os.environ.get("QUOTA_HEADROOM", "0.90"))
 
+# Each in-flight request reserves an estimated cost against its tier until the
+# real usage arrives. Without a reservation, concurrent requests would all read
+# the same remaining balance, pass the check together, and collectively overshoot
+# the cap by far more than HEADROOM absorbs.
+RESERVE_MIN = int(os.environ.get("QUOTA_RESERVE_MIN", "2000"))
+RESERVE_COMPLETION_DEFAULT = int(os.environ.get("QUOTA_RESERVE_COMPLETION", "4000"))
+
 TIER_BUDGET = {
     1: int(os.environ.get("TIER1_DAILY_TOKENS", "250000")),
     2: int(os.environ.get("TIER2_DAILY_TOKENS", "2500000")),
@@ -137,15 +144,40 @@ def current_day() -> str:
 
 # ── Daily counters ────────────────────────────────────────────────────────────
 
+def estimate_request_tokens(payload: dict, raw_len: int) -> int:
+    """Pre-flight cost estimate used to reserve budget before the real number is
+    known: ~4 characters per token for the prompt, plus the completion cap."""
+    completion = (
+        payload.get("max_completion_tokens")
+        or payload.get("max_tokens")
+        or RESERVE_COMPLETION_DEFAULT
+    )
+    try:
+        completion = int(completion)
+    except (TypeError, ValueError):
+        completion = RESERVE_COMPLETION_DEFAULT
+    return max(RESERVE_MIN, raw_len // 4 + completion)
+
+
 class QuotaState:
-    """Token counters for the current day, persisted so restarts don't reset them."""
+    """Token counters for the current day, persisted so restarts don't reset them.
+
+    Budget is checked against used + reserved, and a request reserves its
+    estimated cost while in flight, so parallel requests can't each be told the
+    same budget is free. Only `used` is persisted — reservations are in-flight
+    state with no meaning across a restart.
+    """
 
     def __init__(self, path: str):
         self.path = path
         self._lock = threading.Lock()
         self._day = current_day()
         self._used = {1: 0, 2: 0}
+        self._reserved = {1: 0, 2: 0}
         self._load()
+
+    def _committed_locked(self, tier: int) -> int:
+        return self._used[tier] + self._reserved[tier]
 
     def _apply_preseed(self) -> None:
         """Treat part of today's grant as already spent (see QUOTA_PRESEED_DAY)."""
@@ -207,38 +239,48 @@ class QuotaState:
             self._used = {1: 0, 2: 0}
             self._save_locked()
 
-    def choose_model(self, requested: str) -> tuple[str, int | None, str]:
-        """Pick the model to actually call.
+    def choose_model(self, requested: str, estimate: int) -> tuple[str, int | None, str, int]:
+        """Pick the model to actually call and reserve its estimated cost.
 
-        Returns (model, tier_to_charge, action) where action is one of
-        'as_is', 'downgraded', 'exhausted', 'untracked'.
+        Returns (model, tier_to_charge, action, reserved) where action is one of
+        'as_is', 'downgraded', 'exhausted', 'untracked'. Every non-zero
+        `reserved` must be handed back to settle() exactly once.
         """
         tier = classify(requested)
         if tier is None:
-            return requested, None, "untracked"
+            return requested, None, "untracked", 0
 
         with self._lock:
             self._roll_day_locked()
 
             if tier == 1:
-                if self._used[1] < TIER_SPENDABLE[1]:
-                    return requested, 1, "as_is"
+                if self._committed_locked(1) < TIER_SPENDABLE[1]:
+                    self._reserved[1] += estimate
+                    return requested, 1, "as_is", estimate
                 target = DOWNGRADE.get(normalize_model(requested), DEFAULT_TIER2_MODEL)
-                if self._used[2] < TIER_SPENDABLE[2]:
-                    return target, 2, "downgraded"
-                return target, 2, "exhausted"
+                if self._committed_locked(2) < TIER_SPENDABLE[2]:
+                    self._reserved[2] += estimate
+                    return target, 2, "downgraded", estimate
+                return target, 2, "exhausted", 0
 
-            if self._used[2] < TIER_SPENDABLE[2]:
-                return requested, 2, "as_is"
-            return requested, 2, "exhausted"
+            if self._committed_locked(2) < TIER_SPENDABLE[2]:
+                self._reserved[2] += estimate
+                return requested, 2, "as_is", estimate
+            return requested, 2, "exhausted", 0
 
-    def record(self, tier: int, tokens: int) -> None:
-        if not tier or tokens <= 0:
+    def settle(self, tier: int, reserved: int, tokens: int) -> None:
+        """Release a reservation and charge what the call actually cost."""
+        if not tier:
             return
         with self._lock:
             self._roll_day_locked()
-            self._used[tier] += tokens
-            self._save_locked()
+            if reserved:
+                # Day rollover zeroes `used` but not `reserved`; clamp regardless
+                # so a double settle can never drive this negative.
+                self._reserved[tier] = max(0, self._reserved[tier] - reserved)
+            if tokens > 0:
+                self._used[tier] += tokens
+                self._save_locked()
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -246,6 +288,8 @@ class QuotaState:
                 "day": self._day,
                 "tier1_used": self._used[1],
                 "tier2_used": self._used[2],
+                "tier1_reserved": self._reserved[1],
+                "tier2_reserved": self._reserved[2],
                 "tier1_spendable": TIER_SPENDABLE[1],
                 "tier2_spendable": TIER_SPENDABLE[2],
                 "tier1_budget": TIER_BUDGET[1],
@@ -259,14 +303,19 @@ STATE = QuotaState(STATE_PATH)
 
 def _usage_line() -> str:
     snap = STATE.snapshot()
+
     def pct(used, cap):
         return f"{(100.0 * used / cap):.1f}%" if cap else "n/a"
-    return (
-        f"tier1 {snap['tier1_used']:,}/{snap['tier1_spendable']:,}"
-        f" ({pct(snap['tier1_used'], snap['tier1_spendable'])})"
-        f" | tier2 {snap['tier2_used']:,}/{snap['tier2_spendable']:,}"
-        f" ({pct(snap['tier2_used'], snap['tier2_spendable'])})"
-    )
+
+    def tier(n):
+        used, spendable = snap[f"tier{n}_used"], snap[f"tier{n}_spendable"]
+        held = snap[f"tier{n}_reserved"]
+        # In-flight reservations count against the budget, so show them or the
+        # numbers look wrong mid-burst.
+        extra = f" +{held:,} held" if held else ""
+        return f"tier{n} {used:,}/{spendable:,} ({pct(used, spendable)}){extra}"
+
+    return f"{tier(1)} | {tier(2)}"
 
 
 def extract_total_tokens(payload: dict) -> int:
@@ -325,6 +374,23 @@ class _QuotaHandler(http.server.BaseHTTPRequestHandler):
                 return resp.status, resp.read(), list(resp.headers.items())
         except urllib.error.HTTPError as exc:
             return exc.code, exc.read(), list(exc.headers.items())
+        except (urllib.error.URLError, OSError) as exc:
+            # DNS failure, refused connection or read timeout reaching OpenAI.
+            # Answer with a real 503 rather than letting this escape the handler,
+            # which would drop the connection and leave litellm with a transport
+            # error instead of a status code.
+            reason = getattr(exc, "reason", exc)
+            print(f"[quota] ❌ upstream unreachable for {method} {self.path}: {reason}", flush=True)
+            body_out = json.dumps(
+                {
+                    "error": {
+                        "message": f"openai-quota-proxy: upstream unreachable ({reason})",
+                        "type": "api_connection_error",
+                        "code": "upstream_unreachable",
+                    }
+                }
+            ).encode()
+            return 503, body_out, [("Content-Type", "application/json")]
 
     def _relay(self, status: int, body: bytes, headers: list[tuple[str, str]]) -> None:
         self.send_response(status)
@@ -364,7 +430,8 @@ class _QuotaHandler(http.server.BaseHTTPRequestHandler):
             self._relay(status, resp_body, headers)
             return
 
-        model, tier, action = STATE.choose_model(requested)
+        estimate = estimate_request_tokens(payload, len(body))
+        model, tier, action, reserved = STATE.choose_model(requested, estimate)
 
         if action == "exhausted":
             print(
@@ -394,24 +461,32 @@ class _QuotaHandler(http.server.BaseHTTPRequestHandler):
         elif action == "untracked":
             print(f"[quota] ❔ {requested} is not a known free-tier model — passing through.", flush=True)
 
-        status, resp_body, headers = self._forward("POST", body)
-
-        if status == 200 and tier:
-            try:
-                tokens = extract_total_tokens(json.loads(resp_body))
-            except Exception:
-                tokens = 0
-            if tokens:
-                STATE.record(tier, tokens)
-                print(f"[quota] {model} used {tokens:,} tokens → {_usage_line()}", flush=True)
+        tokens = 0
+        try:
+            status, resp_body, headers = self._forward("POST", body)
+            if status == 200:
+                try:
+                    tokens = extract_total_tokens(json.loads(resp_body))
+                except Exception:
+                    tokens = 0
+                if tokens:
+                    print(f"[quota] {model} used {tokens:,} tokens", flush=True)
+                else:
+                    print(
+                        f"[quota] ⚠️  No usage reported for {model}; counters unchanged.",
+                        flush=True,
+                    )
             else:
-                print(f"[quota] ⚠️  No usage reported for {model}; counters unchanged.", flush=True)
-        elif status != 200:
-            # Errors aren't metered (OpenAI doesn't bill them), but they must be
-            # visible — this is how an upstream block like an org spend limit shows up.
-            detail = resp_body[:300].decode(errors="replace")
-            print(f"[quota] ⚠️  upstream HTTP {status} for {model}: {detail}", flush=True)
+                # Errors aren't metered (OpenAI doesn't bill them), but they must be
+                # visible — this is how a block like an org spend limit shows up.
+                detail = resp_body[:300].decode(errors="replace")
+                print(f"[quota] ⚠️  upstream HTTP {status} for {model}: {detail}", flush=True)
+        finally:
+            # Must run on every path, or a failed call leaks its reservation and
+            # permanently shrinks the day's usable budget.
+            STATE.settle(tier, reserved, tokens)
 
+        print(f"[quota] {_usage_line()}", flush=True)
         self._relay(status, resp_body, headers)
 
 
