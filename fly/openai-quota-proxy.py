@@ -275,7 +275,17 @@ class QuotaState:
             return requested, 2, "exhausted", 0
 
     def settle(self, tier: int, reserved: int, tokens: int) -> None:
-        """Release a reservation and charge what the call actually cost."""
+        """Release a reservation and charge what the call actually cost.
+
+        A request admitted just before the daily rollover settles just after it
+        and is charged to the new day. That is deliberate, not an oversight, and
+        reviewers keep flagging it: OpenAI meters a call when it completes, so
+        the completion day is the day whose grant those tokens most likely came
+        out of. Charging the admission day instead would leave today's counter
+        understating what today's grant has really spent — and undercounting is
+        the direction that ends in a bill. The cost of this choice is bounded by
+        one in-flight request per day, spent conservatively.
+        """
         if not tier:
             return
         with self._lock:
