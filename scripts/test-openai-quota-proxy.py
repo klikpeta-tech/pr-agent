@@ -34,6 +34,8 @@ RESPONSE_DELAY = 0.0
 FORCE_STATUS: int | None = None
 # "usage" -> SSE ending in a usage chunk; "nousage" -> SSE without one.
 FORCE_STREAM: str | None = None
+# Return a normal 200 JSON body with the "usage" object omitted entirely.
+FORCE_NO_USAGE = False
 
 seen_models: list[str] = []
 seen_auth: list[str] = []
@@ -92,25 +94,26 @@ class FakeOpenAI(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(sse)
             return
-        body = json.dumps(
-            {
-                "id": "chatcmpl-fake",
-                "object": "chat.completion",
-                "model": req.get("model"),
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": "ok"},
-                        "finish_reason": "stop",
-                    }
-                ],
-                "usage": {
-                    "prompt_tokens": TOKENS_PER_CALL - 100,
-                    "completion_tokens": 100,
-                    "total_tokens": TOKENS_PER_CALL,
-                },
-            }
-        ).encode()
+        payload = {
+            "id": "chatcmpl-fake",
+            "object": "chat.completion",
+            "model": req.get("model"),
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": TOKENS_PER_CALL - 100,
+                "completion_tokens": 100,
+                "total_tokens": TOKENS_PER_CALL,
+            },
+        }
+        if FORCE_NO_USAGE:
+            payload.pop("usage")
+        body = json.dumps(payload).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -420,17 +423,55 @@ def main() -> int:
         check("usage chunk metered", snap["tier1_used"], TOKENS_PER_CALL)
         check("no reservation left held", snap["tier1_reserved"], 0)
 
-        print("\n=== stream with no usage chunk: unmetered but released ===")
+        # A success with no readable usage must not be free, or repeating it
+        # (e.g. stream: true without stream_options.include_usage) would walk
+        # past both daily caps. Charge the pre-flight estimate instead.
+        print("\n=== stream with no usage chunk falls back to the estimate ===")
         proc.terminate(); proc.wait(timeout=10)
         rm_state()
-        proc = start_proxy()
+        # Pin the estimate to exactly 777 so the fallback charge is checkable.
+        proc = start_proxy({"QUOTA_RESERVE_MIN": "777", "QUOTA_RESERVE_COMPLETION": "0"})
         FORCE_STREAM = "nousage"
         status, _ = call()
         FORCE_STREAM = None
         snap = quota()
         check("stream relayed", status, 200)
-        check("nothing metered (cannot see usage)", snap["tier1_used"], 0)
+        check("charged the estimate, not zero", snap["tier1_used"], 777)
         check("reservation still released", snap["tier1_reserved"], 0)
+
+        print("\n=== non-streamed 200 with no usage field also falls back ===")
+        proc.terminate(); proc.wait(timeout=10)
+        rm_state()
+        proc = start_proxy({"QUOTA_RESERVE_MIN": "777", "QUOTA_RESERVE_COMPLETION": "0"})
+        global FORCE_NO_USAGE
+        FORCE_NO_USAGE = True
+        status, _ = call()
+        FORCE_NO_USAGE = False
+        snap = quota()
+        check("response relayed", status, 200)
+        check("charged the estimate", snap["tier1_used"], 777)
+
+        print("\n=== repeated unreadable responses still hit the cap ===")
+        proc.terminate(); proc.wait(timeout=10)
+        rm_state()
+        # 777-token estimate against a 2000 budget: admits at 0 and 777 and 1554
+        # is over, so the third call must be refused rather than run free forever.
+        proc = start_proxy(
+            {
+                "TIER1_DAILY_TOKENS": "2000",
+                "TIER2_DAILY_TOKENS": "2000",
+                "QUOTA_HEADROOM": "1.0",
+                "QUOTA_RESERVE_MIN": "777",
+                "QUOTA_RESERVE_COMPLETION": "0",
+            }
+        )
+        FORCE_NO_USAGE = True
+        codes = [call()[0] for _ in range(6)]
+        FORCE_NO_USAGE = False
+        snap = quota()
+        check("unreadable calls eventually refused", 429 in codes, True)
+        check("tier1 charged despite no usage", snap["tier1_used"] > 0, True)
+        check("tier1 stayed within budget", snap["tier1_used"] <= 2000, True)
 
         print("\n=== malformed Content-Length answers 400, not a dropped socket ===")
         req = urllib.request.Request(
@@ -448,6 +489,25 @@ def main() -> int:
         except Exception as exc:  # a dropped connection would land here
             bad_status = f"raised {type(exc).__name__}"
         check("malformed header gets a status code", bad_status, 400)
+
+        # A negative length used to be accepted and treated as bodyless, leaving
+        # the real body bytes unread to be parsed as the next request.
+        for bad_len in ("-1", "-4096"):
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{proxy_port}/v1/chat/completions",
+                data=b'{"model": "gpt-5.4-2026-03-05"}',
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            req.add_header("Content-Length", bad_len)
+            try:
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    got = r.status
+            except urllib.error.HTTPError as e:
+                got = e.code
+            except Exception as exc:
+                got = f"raised {type(exc).__name__}"
+            check(f"Content-Length {bad_len} rejected", got, 400)
 
         print("\n=== unreachable upstream answers 503, not a dropped connection ===")
         proc.terminate(); proc.wait(timeout=10)

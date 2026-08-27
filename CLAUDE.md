@@ -67,7 +67,7 @@ Counters live in a JSON file on the `pr_agent_data` Fly volume, mounted at `/dat
 
 Budget is checked against `used + reserved`: a request reserves an estimated cost (prompt length plus the completion cap) while in flight and settles to actual usage afterwards, so parallel requests can't each be told the same budget is free. `QUOTA_HEADROOM` (default `0.90`) is a second margin on top, since a response can still cost more than its estimate. Tune budgets, headroom, and reservation sizing with the env vars documented at the top of `fly/openai-quota-proxy.py`.
 
-One known gap: a streamed response only carries token usage when the request sets `stream_options.include_usage`. pr-agent only streams for `STREAMING_REQUIRED_MODELS` (currently just `openai/qwq-plus`), so nothing streams today, but if that changes the proxy logs a loud "NOT metered" warning rather than silently undercounting.
+A streamed response only carries token usage when the request sets `stream_options.include_usage`, and pr-agent only streams for `STREAMING_REQUIRED_MODELS` (currently just `openai/qwq-plus`), so nothing streams today. If a successful call's usage can't be read — a stream with no usage chunk, or any 200 missing the field — the proxy charges the pre-flight estimate instead of zero and logs why. That matters because a free ride is unbounded: repeating an unreadable request would otherwise walk straight past both daily caps. Over-charging only under-uses the grant; under-charging is what produces a bill. Errors are never charged, since OpenAI doesn't bill them.
 
 Current usage is logged to stdout on every call (`fly logs`), and served as JSON from `http://127.0.0.1:3002/__quota` inside the machine.
 

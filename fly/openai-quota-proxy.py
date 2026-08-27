@@ -455,9 +455,14 @@ class _QuotaHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             length = int(self.headers.get("Content-Length") or 0)
+            if length < 0:
+                raise ValueError("negative Content-Length")
         except ValueError:
             # Reply rather than raising, which would drop the connection with no
-            # status line at all.
+            # status line at all. The connection has to go regardless: framing is
+            # unrecoverable, and any body bytes already sent would otherwise be
+            # read as the start of the next request on a keep-alive connection.
+            self.close_connection = True
             self._reply(
                 400,
                 json.dumps(
@@ -538,18 +543,19 @@ class _QuotaHandler(http.server.BaseHTTPRequestHandler):
 
                 if tokens:
                     print(f"[quota] {model} used {tokens:,} tokens", flush=True)
-                elif streamed:
-                    # Spell this out: the tokens were really spent, we just can't
-                    # see them, so the day's counters now understate real usage.
+                elif tier:
+                    # A successful call always spent tokens. If the response
+                    # doesn't say how many, charge the pre-flight estimate rather
+                    # than let it through free: otherwise a stream sent without
+                    # stream_options.include_usage never moves the counters, and
+                    # repeating it would walk straight past both daily caps.
+                    # Over-charging only under-uses the grant; under-charging bills.
+                    tokens = estimate
+                    why = "streamed with no usage chunk" if streamed else "reported no usage"
                     print(
-                        f"[quota] ⚠️  {model} streamed a response with no usage chunk —"
-                        " NOT metered. Set stream_options.include_usage on streaming"
-                        " requests, or quota enforcement will drift.",
-                        flush=True,
-                    )
-                else:
-                    print(
-                        f"[quota] ⚠️  No usage reported for {model}; counters unchanged.",
+                        f"[quota] ⚠️  {model} {why} — charging the {estimate:,}-token"
+                        " estimate instead. Set stream_options.include_usage on"
+                        " streaming requests so real usage can be metered.",
                         flush=True,
                     )
             else:
