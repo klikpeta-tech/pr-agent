@@ -10,7 +10,7 @@ A single webhook server receives GitHub events from every repo in the org (via t
 2. **`/review`** — posts a code review with findings
 3. **`/improve`** — suggests inline code improvements
 
-When the review passes ("No major issues detected"), the server automatically submits a formal **Approve** review, satisfying branch protection rules.
+When the review lists no focus areas, the server automatically submits a formal **Approve** review, satisfying branch protection rules. When it lists findings, the server requests changes and assigns a human reviewer.
 
 ## Architecture
 

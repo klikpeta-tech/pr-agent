@@ -5,8 +5,8 @@ Reverse proxy that sits in front of pr-agent.
 Forwards all webhook requests to pr-agent (upstream on port 3001), then checks
 whether the incoming event is an issue_comment from the pr-agent bot. Acts on
 the review result:
-  - "No major issues detected" → submits a formal GitHub PR approval.
-  - Issues detected (pr-agent review comment without the above phrase) →
+  - Review lists no focus areas → submits a formal GitHub PR approval.
+  - Review lists at least one focus area (or its shape can't be recognised) →
     submits REQUEST_CHANGES and adds REVIEWER_USERNAME as a requested reviewer.
 
 Auth:
@@ -27,6 +27,7 @@ import hmac
 import http.server
 import json
 import os
+import re
 import threading
 import urllib.error
 import urllib.request
@@ -42,10 +43,20 @@ APP_ID = os.environ.get("GITHUB__APP_ID", "")
 PRIVATE_KEY = os.environ.get("GITHUB__PRIVATE_KEY", "").replace("\\n", "\n")
 BOT_PAT = os.environ.get("GITHUB__BOT_PAT", "")
 
-APPROVAL_TRIGGER = "No major issues detected"
 # pr-agent review comments always contain this header; guards against acting on
 # /describe or /improve bot comments.
 REVIEW_COMMENT_MARKER = "PR Reviewer Guide"
+
+# pr-agent lists each finding inside this table cell, and when there are none it
+# drops the section's contents entirely (it pops `key_issues_to_review`), leaving
+# the cell empty. An empty cell is therefore the only reliable "clean review"
+# signal available in the rendered comment.
+#
+# This used to look for the prose phrase "No major issues detected", which never
+# matched: upstream only writes that string (lowercased, at that) as an internal
+# reason for *withholding* a review, never in the published body. Every review
+# therefore took the request-changes branch and no PR was ever auto-approved.
+FOCUS_AREAS_HEADING = "Recommended focus areas for review"
 # Pin to the exact bot login so a different GitHub App can't spoof the trigger.
 PR_AGENT_BOT_LOGIN = os.environ.get("PR_AGENT_BOT_LOGIN", "klikpeta-pr-agent[bot]")
 REVIEWER_USERNAME = os.environ.get("REVIEWER_USERNAME", "mfhanif")
@@ -207,6 +218,29 @@ def _request_changes_and_add_reviewer(
         print(f"[auto-action] ❌ Unexpected error on PR #{pull_number}: {exc}", flush=True)
 
 
+def review_is_clean(body: str) -> bool:
+    """True only when the review's focus-areas cell is present and empty.
+
+    Deliberately requires positive evidence of a clean review rather than just
+    the absence of a finding marker. If pr-agent's markup ever changes shape,
+    the cell will contain something unrecognised, this returns False, and the
+    caller requests changes — the safe direction. Guessing "clean" wrong would
+    auto-approve a PR that has real findings, and these approvals count toward
+    branch protection.
+    """
+    start = body.find(FOCUS_AREAS_HEADING)
+    if start == -1:
+        return False  # section missing entirely: can't tell, so assume not clean
+    start += len(FOCUS_AREAS_HEADING)
+    end = body.find("</td>", start)
+    if end == -1:
+        return False
+    cell = body[start:end]
+    text = re.sub(r"<[^>]+>", "", cell)  # drop the </strong>, <br>, <details>…
+    text = text.replace("&nbsp;", " ")
+    return not text.strip()
+
+
 def _maybe_auto_action(event_type: str, payload: dict) -> None:
     if event_type != "issue_comment":
         return
@@ -244,9 +278,9 @@ def _maybe_auto_action(event_type: str, payload: dict) -> None:
         print("[auto-action] Missing required fields in payload, skipping.", flush=True)
         return
 
-    if APPROVAL_TRIGGER in body:
+    if review_is_clean(body):
         print(
-            f"[auto-action] Approval trigger on PR #{pull_number} in {owner}/{repo_name}"
+            f"[auto-action] No findings on PR #{pull_number} in {owner}/{repo_name}"
             f" (comment by {sender_login})",
             flush=True,
         )
@@ -302,6 +336,17 @@ class _ProxyHandler(http.server.BaseHTTPRequestHandler):
                 return resp.status, resp.read()
         except urllib.error.HTTPError as exc:
             return exc.code, exc.read()
+        except (urllib.error.URLError, OSError) as exc:
+            # Connection refused means pr-agent isn't listening yet (or has died);
+            # OSError also covers read timeouts. Reply 503 instead of letting the
+            # handler raise, which would dump a traceback and drop the connection.
+            reason = getattr(exc, "reason", exc)
+            print(
+                f"[proxy] ❌ upstream :{UPSTREAM_PORT} unreachable for {method} {self.path}"
+                f" ({reason})",
+                flush=True,
+            )
+            return 503, b'{"error": "pr-agent upstream unavailable"}'
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))

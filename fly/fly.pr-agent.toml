@@ -7,6 +7,16 @@ primary_region = 'sin'
 [build]
   dockerfile = 'pr-agent.Dockerfile'
 
+[env]
+  # Free-tier token counters live on the volume below, so they survive a deploy.
+  # Without this they would sit in /tmp and reset on every image change, handing
+  # the proxy a full tier-1 budget it has not actually spent.
+  QUOTA_STATE_PATH = '/data/openai-quota-state.json'
+
+[mounts]
+  source = 'pr_agent_data'
+  destination = '/data'
+
 [http_service]
   internal_port = 3000
   force_https = true

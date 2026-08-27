@@ -19,6 +19,13 @@ fly logs --app klikpeta-pr-agent
 fly ssh console --app klikpeta-pr-agent
 ```
 
+Before deploying, run the tests for whichever proxy you changed (no network or deps needed):
+
+```bash
+python scripts/test-openai-quota-proxy.py
+python scripts/test-auto-approve-proxy.py
+```
+
 ## One-time setup scripts
 
 ```bash
@@ -31,21 +38,46 @@ python scripts/set-fly-secrets.py --pem ~/Downloads/klikpeta-pr-agent.*.pem
 
 ## Architecture
 
-The Docker image runs **two processes** via `fly/entrypoint.sh`:
+The Docker image runs **three processes** via `fly/entrypoint.sh`:
 
+- **openai-quota-proxy** (`port 3002`, localhost only) — meters OpenAI free-tier usage
 - **pr-agent** (`port 3001`, internal) — the upstream PR-Agent webhook server
 - **auto-approve-proxy** (`port 3000`, public) — thin Python reverse proxy
 
-The proxy forwards all webhook traffic to pr-agent, then inspects `issue_comment` events. When a bot comment contains `"No major issues detected"`, it fires a GitHub PR approval in a background thread.
+The auto-approve proxy forwards all webhook traffic to pr-agent, then inspects `issue_comment` events. When pr-agent's review lists no focus areas, it fires a GitHub PR approval in a background thread; otherwise it submits REQUEST_CHANGES and adds `REVIEWER_USERNAME` as a reviewer.
+
+**How "clean" is detected.** pr-agent renders each finding inside the "Recommended focus areas for review" table cell and, when there are none, drops the section's contents entirely (it pops `key_issues_to_review`), leaving the cell empty. `review_is_clean()` therefore requires that cell to be *present and empty* — positive evidence — rather than merely lacking a finding marker. If the markup ever changes shape, the check returns False and the PR gets REQUEST_CHANGES, which is the safe direction: wrongly guessing "clean" would auto-approve a PR with real findings, and these approvals count toward branch protection.
+
+Do not go back to matching a prose phrase. The proxy originally looked for `"No major issues detected"`, which never matched — upstream only writes that string (lowercased) as an internal reason for *withholding* a review, never in the published comment — so every review took the request-changes branch and no PR was ever auto-approved.
+
+**Startup order matters.** `entrypoint.sh` starts each process only after the previous one is accepting connections, polled with `wait_for_port` (fatal if a process dies or never binds). The public port 3000 must stay closed until pr-agent is actually serving: pr-agent takes ~10s to bind, and if the proxy accepts traffic before then, the request gets a 502 instead of Fly holding the connection until the app is ready. That matters because the machine is normally suspended, so a GitHub webhook is what wakes it — and a 502 is a failed delivery. Note this only affects genuine cold boots (after a deploy or an explicit stop, ~20s); the usual idle wake is a suspend/resume that restores memory with all three ports already bound, in well under a second.
 
 **Approval auth priority:** `GITHUB__BOT_PAT` (human PAT, counts toward branch protection) → GitHub App installation token fallback.
+
+### OpenAI free-tier metering
+
+pr-agent sends every LLM call to the quota proxy via `[openai] api_base` in the override TOML. The proxy forwards to `api.openai.com`, reads `usage.total_tokens` off each response, and keeps per-day counters for the two free-grant buckets (tier 1 ≈250K tokens/day for `gpt-5.4` etc., tier 2 ≈2.5M/day for the `-mini`/`-nano` variants). Once tier 1 is spent it rewrites the request's `model` to the tier-2 sibling; once tier 2 is spent too it returns 429 instead of letting the call be billed.
+
+Two non-obvious reasons it works this way:
+
+- **pr-agent's `fallback_models` cannot do this job.** Overage isn't refused by OpenAI, it's billed — so the primary model keeps returning 200 and no fallback ever fires.
+- **An org-level enforced spend limit cannot either.** It's all-or-nothing: once tripped, *every* model 429s at once, so falling back to a mini model fails as well. (This is what took the app fully down on 2026-07-31.) Keep a small non-zero spend limit as a backstop against bugs in the proxy's own counting — just don't rely on it to pick models.
+
+Counters live in a JSON file on the `pr_agent_data` Fly volume, mounted at `/data` and pointed at by `QUOTA_STATE_PATH` in `fly.pr-agent.toml`. The volume is what makes the counters survive `fly deploy` — in `/tmp` (the code's default, still used for local runs) they reset on every image change, handing the proxy a full tier-1 budget it hasn't actually spent. Note that attaching the volume pins the app to one machine in `sin`, and adding or removing the mount replaces the machine rather than updating it in place.
+
+Budget is checked against `used + reserved`: a request reserves an estimated cost (prompt length plus the completion cap) while in flight and settles to actual usage afterwards, so parallel requests can't each be told the same budget is free. `QUOTA_HEADROOM` (default `0.90`) is a second margin on top, since a response can still cost more than its estimate. Tune budgets, headroom, and reservation sizing with the env vars documented at the top of `fly/openai-quota-proxy.py`.
+
+A streamed response only carries token usage when the request sets `stream_options.include_usage`, and pr-agent only streams for `STREAMING_REQUIRED_MODELS` (currently just `openai/qwq-plus`), so nothing streams today. If a successful call's usage can't be read — a stream with no usage chunk, or any 200 missing the field — the proxy charges the pre-flight estimate instead of zero and logs why. That matters because a free ride is unbounded: repeating an unreadable request would otherwise walk straight past both daily caps. Over-charging only under-uses the grant; under-charging is what produces a bill. Errors are never charged, since OpenAI doesn't bill them.
+
+Current usage is logged to stdout on every call (`fly logs`), and served as JSON from `http://127.0.0.1:3002/__quota` inside the machine.
 
 ## Key files
 
 | File | Purpose |
 |---|---|
-| `fly/entrypoint.sh` | Starts both processes; kills container if either dies |
+| `fly/entrypoint.sh` | Starts all three processes; kills container if any dies |
 | `fly/auto-approve-proxy.py` | Reverse proxy + auto-approve logic |
+| `fly/openai-quota-proxy.py` | Meters OpenAI free-tier tokens; downgrades tier 1 → tier 2, then hard-stops |
 | `fly/pr-agent.Dockerfile` | Builds image from `pragent/pr-agent:latest` |
 | `fly/pr-agent-override.toml` | Baked-in pr-agent config (model, triggers, review settings); copied to `/app/pr_agent/settings/.secrets.toml` |
 | `fly/pr-agent.org-config.toml` | Org-wide config — deploy to `klikpeta-tech/.github` as `.pr_agent.toml` |
