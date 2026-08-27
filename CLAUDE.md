@@ -19,10 +19,11 @@ fly logs --app klikpeta-pr-agent
 fly ssh console --app klikpeta-pr-agent
 ```
 
-Before deploying a change to `fly/openai-quota-proxy.py`, run its tests (no network or deps needed):
+Before deploying, run the tests for whichever proxy you changed (no network or deps needed):
 
 ```bash
 python scripts/test-openai-quota-proxy.py
+python scripts/test-auto-approve-proxy.py
 ```
 
 ## One-time setup scripts
@@ -43,7 +44,11 @@ The Docker image runs **three processes** via `fly/entrypoint.sh`:
 - **pr-agent** (`port 3001`, internal) — the upstream PR-Agent webhook server
 - **auto-approve-proxy** (`port 3000`, public) — thin Python reverse proxy
 
-The auto-approve proxy forwards all webhook traffic to pr-agent, then inspects `issue_comment` events. When a bot comment contains `"No major issues detected"`, it fires a GitHub PR approval in a background thread.
+The auto-approve proxy forwards all webhook traffic to pr-agent, then inspects `issue_comment` events. When pr-agent's review lists no focus areas, it fires a GitHub PR approval in a background thread; otherwise it submits REQUEST_CHANGES and adds `REVIEWER_USERNAME` as a reviewer.
+
+**How "clean" is detected.** pr-agent renders each finding inside the "Recommended focus areas for review" table cell and, when there are none, drops the section's contents entirely (it pops `key_issues_to_review`), leaving the cell empty. `review_is_clean()` therefore requires that cell to be *present and empty* — positive evidence — rather than merely lacking a finding marker. If the markup ever changes shape, the check returns False and the PR gets REQUEST_CHANGES, which is the safe direction: wrongly guessing "clean" would auto-approve a PR with real findings, and these approvals count toward branch protection.
+
+Do not go back to matching a prose phrase. The proxy originally looked for `"No major issues detected"`, which never matched — upstream only writes that string (lowercased) as an internal reason for *withholding* a review, never in the published comment — so every review took the request-changes branch and no PR was ever auto-approved.
 
 **Startup order matters.** `entrypoint.sh` starts each process only after the previous one is accepting connections, polled with `wait_for_port` (fatal if a process dies or never binds). The public port 3000 must stay closed until pr-agent is actually serving: pr-agent takes ~10s to bind, and if the proxy accepts traffic before then, the request gets a 502 instead of Fly holding the connection until the app is ready. That matters because the machine is normally suspended, so a GitHub webhook is what wakes it — and a 502 is a failed delivery. Note this only affects genuine cold boots (after a deploy or an explicit stop, ~20s); the usual idle wake is a suspend/resume that restores memory with all three ports already bound, in well under a second.
 
