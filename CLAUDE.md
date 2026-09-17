@@ -44,7 +44,7 @@ The Docker image runs **three processes** via `fly/entrypoint.sh`:
 - **pr-agent** (`port 3001`, internal) — the upstream PR-Agent webhook server
 - **auto-approve-proxy** (`port 3000`, public) — thin Python reverse proxy
 
-The auto-approve proxy forwards all webhook traffic to pr-agent, then inspects `issue_comment` events. When pr-agent's review lists no focus areas, it fires a GitHub PR approval in a background thread; otherwise it submits REQUEST_CHANGES and adds `REVIEWER_USERNAME` as a reviewer.
+The auto-approve proxy forwards all webhook traffic to pr-agent, then inspects `issue_comment` events. When pr-agent's review lists no focus areas, it fires a GitHub PR approval in a background thread; otherwise it submits REQUEST_CHANGES.
 
 **How "clean" is detected.** pr-agent renders each finding inside the "Recommended focus areas for review" table cell and, when there are none, drops the section's contents entirely (it pops `key_issues_to_review`), leaving the cell empty. `review_is_clean()` therefore requires that cell to be *present and empty* — positive evidence — rather than merely lacking a finding marker. If the markup ever changes shape, the check returns False and the PR gets REQUEST_CHANGES, which is the safe direction: wrongly guessing "clean" would auto-approve a PR with real findings, and these approvals count toward branch protection.
 

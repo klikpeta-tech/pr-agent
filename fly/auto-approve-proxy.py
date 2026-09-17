@@ -7,17 +7,16 @@ whether the incoming event is an issue_comment from the pr-agent bot. Acts on
 the review result:
   - Review lists no focus areas → submits a formal GitHub PR approval.
   - Review lists at least one focus area (or its shape can't be recognised) →
-    submits REQUEST_CHANGES and adds REVIEWER_USERNAME as a requested reviewer.
+    submits REQUEST_CHANGES.
 
 Auth:
-  All review actions (approve, request changes, add reviewer) use the GitHub
-  App installation token. The App must have contents:write permission so its
+  All review actions (approve, request changes) use the GitHub App
+  installation token. The App must have contents:write permission so its
   reviews count toward branch protection required approvals.
 
 Other environment variables:
   GITHUB__WEBHOOK_SECRET   Used to verify incoming webhook signatures
   PR_AGENT_BOT_LOGIN       Exact GitHub login of the pr-agent bot (default: klikpeta-pr-agent[bot])
-  REVIEWER_USERNAME        GitHub login to assign as reviewer when issues are found (default: mfhanif)
   PORT          Port this proxy listens on  (default 3000)
   UPSTREAM_PORT Port pr-agent listens on   (default 3001)
 """
@@ -59,7 +58,6 @@ REVIEW_COMMENT_MARKER = "PR Reviewer Guide"
 FOCUS_AREAS_HEADING = "Recommended focus areas for review"
 # Pin to the exact bot login so a different GitHub App can't spoof the trigger.
 PR_AGENT_BOT_LOGIN = os.environ.get("PR_AGENT_BOT_LOGIN", "klikpeta-pr-agent[bot]")
-REVIEWER_USERNAME = os.environ.get("REVIEWER_USERNAME", "mfhanif")
 
 
 # ── JWT / GitHub token helpers ────────────────────────────────────────────────
@@ -128,8 +126,8 @@ def _approve_pr(owner: str, repo: str, pull_number: int, installation_id: int) -
         print(f"[auto-approve] ❌ Failed to approve PR #{pull_number}: {exc}", flush=True)
 
 
-def _request_changes_and_add_reviewer(
-    owner: str, repo: str, pull_number: int, installation_id: int, pr_author: str
+def _request_changes(
+    owner: str, repo: str, pull_number: int, installation_id: int
 ) -> None:
     try:
         token = _get_installation_token(installation_id)
@@ -140,50 +138,6 @@ def _request_changes_and_add_reviewer(
             "X-GitHub-Api-Version": "2022-11-28",
         }
 
-        # 1. Add reviewer — skip if unset or if reviewer is the PR author
-        if REVIEWER_USERNAME and REVIEWER_USERNAME != pr_author:
-            reviewer_body = json.dumps({"reviewers": [REVIEWER_USERNAME]}).encode()
-            req = urllib.request.Request(
-                f"https://api.github.com/repos/{owner}/{repo}/pulls/{pull_number}/requested_reviewers",
-                data=reviewer_body,
-                method="POST",
-                headers=gh_headers,
-            )
-            try:
-                with urllib.request.urlopen(req, timeout=15):
-                    pass
-                print(
-                    f"[auto-action] 👤 Added {REVIEWER_USERNAME} as reviewer on PR #{pull_number}"
-                    f" in {owner}/{repo}",
-                    flush=True,
-                )
-            except urllib.error.HTTPError as exc:
-                detail = exc.read().decode(errors="replace")
-                if exc.code == 422:
-                    print(
-                        f"[auto-action] ⚠️  Could not add reviewer on PR #{pull_number}"
-                        f" (HTTP 422 — already added): {detail}",
-                        flush=True,
-                    )
-                else:
-                    print(
-                        f"[auto-action] ❌ Failed to add reviewer on PR #{pull_number}:"
-                        f" HTTP {exc.code} {detail}",
-                        flush=True,
-                    )
-            except Exception as exc:
-                # Catch network/timeout errors so REQUEST_CHANGES still runs below.
-                print(
-                    f"[auto-action] ❌ Failed to add reviewer on PR #{pull_number}: {exc}",
-                    flush=True,
-                )
-        elif REVIEWER_USERNAME and REVIEWER_USERNAME == pr_author:
-            print(
-                f"[auto-action] ⏭️  Skipping reviewer assignment — {pr_author} is the PR author",
-                flush=True,
-            )
-
-        # 2. Request changes
         review_body = json.dumps(
             {"event": "REQUEST_CHANGES", "body": "pr-agent found issues — review required. ⚠️"}
         ).encode()
@@ -296,8 +250,8 @@ def _maybe_auto_action(event_type: str, payload: dict) -> None:
             flush=True,
         )
         threading.Thread(
-            target=_request_changes_and_add_reviewer,
-            args=(owner, repo_name, pull_number, installation_id, pr_author),
+            target=_request_changes,
+            args=(owner, repo_name, pull_number, installation_id),
             daemon=True,
         ).start()
 
