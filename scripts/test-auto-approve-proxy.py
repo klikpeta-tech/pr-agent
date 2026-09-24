@@ -102,6 +102,27 @@ charged to the new day.
 </table>
 """
 
+# A review with a real finding whose quoted content happens to include the
+# exact no-issues-row markup verbatim — realistic for this repo specifically,
+# since a review of auto-approve-proxy.py's own diff could easily quote this
+# string as an example. Must not short-circuit to "clean": the finding, and
+# the "Recommended focus areas" heading it lives under, are real.
+QUOTED_NO_ISSUES_MARKUP_INSIDE_FINDING = """## PR Reviewer Guide 🔍
+
+<table>
+<tr><td>⚡&nbsp;<strong>Recommended focus areas for review</strong><br><br>
+
+<details><summary><strong>False approval risk</strong></a>
+
+If a finding's own quoted text contains
+<td>⚡&nbsp;<strong>No major issues detected</strong></td>
+verbatim, a naive substring search would misclassify this review as clean.
+</summary></details>
+
+</td></tr>
+</table>
+"""
+
 spec = importlib.util.spec_from_file_location("aap", PROXY_SRC)
 aap = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(aap)
@@ -110,6 +131,11 @@ print("=== real captured review bodies ===")
 check("clean review (empty focus cell) is clean", aap.review_is_clean(CLEAN), True)
 check("clean review (no-findings row) is clean", aap.review_is_clean(CLEAN_NO_FINDINGS_ROW), True)
 check("review with 2 findings is not clean", aap.review_is_clean(WITH_FINDINGS), False)
+check(
+    "no-issues markup quoted inside a real finding is not clean",
+    aap.review_is_clean(QUOTED_NO_ISSUES_MARKUP_INSIDE_FINDING),
+    False,
+)
 
 print("\n=== a single finding must still block ===")
 one_finding = CLEAN.replace(

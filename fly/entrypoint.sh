@@ -78,8 +78,19 @@ wait_for_port "auto-approve proxy" 3000 "$PROXY_PID" || { stop_all; exit 1; }
 
 echo "[entrypoint] All processes up — ready to serve on :3000"
 
+# Consecutive failed health probes (see wait_any below) before treating the
+# app as wedged rather than transiently slow. At the 5s loop cadence this is
+# ~30s of sustained unresponsiveness — Fly's own [[http_service.checks]] only
+# stops routing to an unhealthy machine, it never restarts or stops one
+# automatically ("this needs to be done manually" per Fly's own health-check
+# docs), so without this watchdog a hung-but-alive process (kill -0 still
+# succeeds) can sit unresponsive indefinitely with nothing to recover it.
+# This happened for real on 2026-09-24 and needed a manual `fly apps restart`.
+WATCHDOG_FAILURE_THRESHOLD="${WATCHDOG_FAILURE_THRESHOLD:-6}"
+
 # If any process dies, take down the others and exit so Fly restarts the container.
 wait_any() {
+    local health_failures=0
     while true; do
         if ! kill -0 "$PR_AGENT_PID" 2>/dev/null; then
             echo "[entrypoint] pr-agent exited, shutting down."
@@ -98,6 +109,19 @@ wait_any() {
             echo "[entrypoint] quota proxy exited, shutting down."
             stop_all
             exit 1
+        fi
+        # All three processes are alive per kill -0, but "alive" isn't "serving" —
+        # probe the same endpoint Fly's own health check uses.
+        if curl -fsS --max-time 5 -o /dev/null "http://127.0.0.1:3000/"; then
+            health_failures=0
+        else
+            health_failures=$((health_failures + 1))
+            echo "[entrypoint] health probe failed ($health_failures/$WATCHDOG_FAILURE_THRESHOLD)"
+            if [ "$health_failures" -ge "$WATCHDOG_FAILURE_THRESHOLD" ]; then
+                echo "[entrypoint] pr-agent alive but unresponsive for too long, shutting down for Fly to restart."
+                stop_all
+                exit 1
+            fi
         fi
         sleep 5
     done

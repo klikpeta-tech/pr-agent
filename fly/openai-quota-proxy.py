@@ -58,6 +58,8 @@ Environment variables
   OPENAI_MINI_DAILY_TOKENS  `openai_mini` free-grant budget            (default 2500000)
   DEEPSEEK_DAILY_TOKENS     `deepseek` circuit-breaker cap             (default 20000000)
   QUOTA_HEADROOM            Fraction of budget actually usable         (default 0.90)
+  QUOTA_RESERVE_MIN         Minimum per-request in-flight reservation  (default 2000)
+  QUOTA_RESERVE_COMPLETION  Completion-token reservation used when the request sets no max_tokens (default 4000)
   QUOTA_TZ_OFFSET_HOURS     Hour offset for the daily reset            (default 0 = UTC midnight)
   QUOTA_UPSTREAM_TIMEOUT    Upstream request timeout, seconds          (default 300)
 

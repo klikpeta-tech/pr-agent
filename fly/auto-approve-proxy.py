@@ -191,10 +191,19 @@ def review_is_clean(body: str) -> bool:
     auto-approve a PR that has real findings, and these approvals count toward
     branch protection.
     """
-    if NO_ISSUES_ROW_RE.search(body):
+    start = body.find(FOCUS_AREAS_HEADING)
+
+    # Shape 1 only counts when the "Recommended focus areas" heading is absent
+    # entirely — pr-agent's renderer emits one shape or the other, never both,
+    # so a real review with findings always carries that heading. Requiring
+    # its absence here means a finding that happens to quote the no-issues
+    # row's exact markup (e.g. discussing this very file, as a review of this
+    # file's own diff realistically could) can't trigger a false approval:
+    # the heading from the review's actual findings section still short-
+    # circuits it to the "not clean" path below.
+    if start == -1 and NO_ISSUES_ROW_RE.search(body):
         return True
 
-    start = body.find(FOCUS_AREAS_HEADING)
     if start == -1:
         return False  # neither shape present: can't tell, so assume not clean
     start += len(FOCUS_AREAS_HEADING)
