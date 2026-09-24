@@ -1,7 +1,68 @@
 [config]
 model = "gpt-5.4-2026-03-05"
-model_weak = "gpt-4.1-mini"
-fallback_models = ["gpt-5.4-mini"]
+# Upstream default is 120s, sized for OpenAI. DeepSeek (deepseek-v4-flash,
+# thinking mode — now the default overflow target once `openai` is exhausted,
+# and used directly for model_weak's fallback) has been observed taking well
+# over 120s on this PR's diff. With retry_same_model_on_timeout left at its
+# default (true), a 120s timeout doesn't fail fast — it retries the same slow
+# model repeatedly, and a review can burn ~15+ minutes across retries without
+# ever completing or posting anything. Match this to the quota proxy's own
+# QUOTA_UPSTREAM_TIMEOUT (300s, see openai-quota-proxy.py) so neither side
+# gives up before the other.
+ai_timeout = 300
+# DeepSeek's own API defaults deepseek-v4-flash to thinking mode at "high"
+# reasoning effort (api-docs.deepseek.com/guides/thinking_mode) — that's the
+# real source of the slow/timing-out calls, not just something to work around
+# with a longer timeout. pr-agent already has a config.reasoning_effort
+# default ("medium", see upstream configuration.toml) that would normally
+# rein this in, but it only auto-applies to models litellm's bundled metadata
+# already knows are reasoning-capable — deepseek-v4-flash is too new for
+# that, the same reason it's missing from pr-agent's own MAX_TOKENS table
+# (see custom_model_max_tokens below). additional_reasoning_effort_models is
+# the documented escape hatch for exactly this case: it makes DeepSeek
+# receive config.reasoning_effort as a real top-level `reasoning_effort`
+# kwarg (litellm forwards it; DeepSeek's own API accepts that same parameter
+# name) instead of silently falling back to DeepSeek's own high-effort
+# default.
+additional_reasoning_effort_models = ["deepseek/deepseek-v4-flash"]
+# Upstream default (true) retries the SAME model on a timeout before moving to
+# fallback_models. Since our primary `gpt-5.4` request is often transparently
+# downgraded to the slow-and-occasionally-timing-out DeepSeek overflow (see
+# openai-quota-proxy.py), a timeout there just repeats the same slow call
+# instead of failing fast — this is exactly what caused a real ~18-minute
+# stall on 2026-09-23/24 where a push-triggered review silently never
+# completed or posted anything. false makes one timeout move straight to
+# fallback_models[0] = gpt-5.4-mini, a normally-fast real OpenAI call with
+# its own separate, usually-underused daily budget (openai_mini).
+retry_same_model_on_timeout = false
+# model_weak has no provider prefix, so like config.model it goes through
+# [openai] api_base below (the quota proxy). openai-quota-proxy.py tracks
+# gpt-5.4-mini against its own separate OpenAI free-grant budget (the
+# `openai_mini` bucket — a real, distinct daily grant from the `openai`
+# bucket config.model uses) and hard-stops (429) once it's spent, same as it
+# always did. There's no in-proxy downgrade target for that bucket: a 429
+# here is a genuine failure pr-agent sees, so its own fallback_models list
+# below (which already lists deepseek/deepseek-v4-flash right after
+# gpt-5.4-mini) picks it up from there.
+model_weak = "gpt-5.4-mini"
+# deepseek-v4-flash isn't in pr-agent's bundled MAX_TOKENS table (only the
+# retired deepseek-chat/deepseek-reasoner aliases are), so pin its context
+# window explicitly rather than rely on a litellm registry lookup that may not
+# know this model yet. Needed because it appears in fallback_models below, and
+# because openai-quota-proxy.py silently reroutes config.model to it once the
+# `openai` (gpt-5.4) daily grant is spent (see the proxy's own docstring) —
+# that rewrite happens at the HTTP layer, after pr-agent has already done its
+# own token budgeting against whatever model it thinks it's calling.
+custom_model_max_tokens = 128000
+# retry_with_fallback_models() tries [config.model] + fallback_models in order
+# for every command, but only on a genuine failure — the quota proxy's own
+# openai -> DeepSeek reroute above is invisible to this and normally handles
+# that specific exhaustion before pr-agent ever sees an error. This list is
+# what actually handles openai_mini exhaustion (no in-proxy downgrade target
+# for it), and is the second line of defense if the proxy itself is
+# unreachable or DeepSeek is unavailable/capped when the proxy tries it
+# internally for the openai bucket.
+fallback_models = ["gpt-5.4-mini", "deepseek/deepseek-v4-flash"]
 deployment_type = "app"
 
 [openai]
@@ -22,6 +83,13 @@ push_commands = ["/review", "/improve"]
 
 [pr_reviewer]
 persistent_comment = true
+# The review-finding-state layer (which tracks per-finding resolution across
+# pushes) can't verify its hidden state marker under our GitHub App deployment
+# (deployment_type = "app") and falls back to posting a brand-new "Standalone
+# PR Review" comment on every run instead of editing the existing one. We
+# don't use per-finding resolution tracking, so disable that layer and let
+# reviews use plain persistent-comment editing, same as /improve already does.
+persistent_finding_state = false
 num_max_findings = 3
 enable_review_labels_security = true
 enable_review_labels_effort = true
