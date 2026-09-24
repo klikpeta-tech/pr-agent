@@ -62,8 +62,8 @@ Environment variables
   QUOTA_UPSTREAM_TIMEOUT    Upstream request timeout, seconds          (default 300)
 
   QUOTA_PRESEED_DAY         Date (YYYY-MM-DD) the preseed below applies to
-  QUOTA_PRESEED_OPENAI      Tokens to treat as already spent on that day
-  QUOTA_PRESEED_OPENAI_MINI Tokens to treat as already spent on that day
+  QUOTA_PRESEED_OPENAI      Tokens to treat as already spent on that day (falls back to the pre-rename QUOTA_PRESEED_TIER1)
+  QUOTA_PRESEED_OPENAI_MINI Tokens to treat as already spent on that day (falls back to the pre-rename QUOTA_PRESEED_TIER2)
 
 The preseed exists because the counters start at zero on a fresh deploy while
 OpenAI's real grant may already be partly spent — sending `openai` traffic then
@@ -91,8 +91,10 @@ TZ_OFFSET_HOURS = float(os.environ.get("QUOTA_TZ_OFFSET_HOURS", "0"))
 
 PRESEED_DAY = os.environ.get("QUOTA_PRESEED_DAY", "").strip()
 PRESEED = {
-    "openai": int(os.environ.get("QUOTA_PRESEED_OPENAI", "0")),
-    "openai_mini": int(os.environ.get("QUOTA_PRESEED_OPENAI_MINI", "0")),
+    # Fall back to the pre-rename names so a deployment still exporting
+    # QUOTA_PRESEED_TIER1/TIER2 doesn't silently preseed nothing.
+    "openai": int(os.environ.get("QUOTA_PRESEED_OPENAI") or os.environ.get("QUOTA_PRESEED_TIER1", "0")),
+    "openai_mini": int(os.environ.get("QUOTA_PRESEED_OPENAI_MINI") or os.environ.get("QUOTA_PRESEED_TIER2", "0")),
 }
 
 # Only a fraction of each budget is spendable. Token cost is only known *after*
@@ -188,6 +190,14 @@ class QuotaState:
     """
 
     TIERS = ("openai", "openai_mini", "deepseek")
+    # Pre-rewrite state files (still possibly sitting on the persistent volume
+    # from before the openai/openai_mini/deepseek bucket rename) used these
+    # key names. Without this mapping, `_load()` would silently read a
+    # same-day legacy file as all-zero (a real free-grant budget the day had
+    # actually already spent), letting a proxy that believes it has a full
+    # budget send real OpenAI overage as "as_is" traffic. There is no legacy
+    # equivalent for `deepseek` — that bucket didn't exist before the rename.
+    _LEGACY_TIER_KEYS = {"openai": "tier1", "openai_mini": "tier2"}
 
     def __init__(self, path: str):
         self.path = path
@@ -233,13 +243,29 @@ class QuotaState:
             )
             self._apply_preseed()
             return
+        migrated = []
         for tier in self.TIERS:
-            self._used[tier] = int(data.get(tier, 0))
+            if tier in data:
+                self._used[tier] = int(data.get(tier, 0))
+                continue
+            legacy_key = self._LEGACY_TIER_KEYS.get(tier)
+            if legacy_key is not None and legacy_key in data:
+                self._used[tier] = int(data.get(legacy_key, 0))
+                migrated.append(f"{legacy_key}->{tier}")
+            else:
+                self._used[tier] = 0
         print(
             f"[quota] Resumed {self._day}: "
             + " ".join(f"{t}={self._used[t]:,}" for t in self.TIERS),
             flush=True,
         )
+        if migrated:
+            print(
+                f"[quota] Migrated legacy state keys ({', '.join(migrated)});"
+                " rewriting state file in the current format.",
+                flush=True,
+            )
+            self._save_locked()
 
     def _save_locked(self) -> None:
         payload = {"day": self._day, **{t: self._used[t] for t in self.TIERS}}

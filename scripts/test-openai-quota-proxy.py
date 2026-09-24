@@ -338,6 +338,28 @@ def main() -> int:
         check("openai resumed", quota()["openai_used"], 400)
         check("openai_mini resumed", quota()["openai_mini_used"], 400)
 
+        print("\n=== a same-day legacy tier1/tier2 state file migrates, not resets ===")
+        # Regression test for a real incident: the bucket rename (tier1/tier2 ->
+        # openai/openai_mini/deepseek) shipped without this migration, so a
+        # state file still on the persistent volume from before the rename
+        # loaded as all-zero on the same day — even though the real free-grant
+        # budget it represented was already ~98% spent. The proxy then treated
+        # a near-exhausted OpenAI grant as fresh, and let real overage through
+        # as ordinary "as_is" tier-1 traffic.
+        proc.terminate(); proc.wait(timeout=10)
+        legacy_today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        with open(state, "w") as fh:
+            json.dump({"day": legacy_today, "tier1": 221340, "tier2": 2246417}, fh)
+        proc = start_proxy()
+        snap = quota()
+        check("legacy tier1 migrated to openai", snap["openai_used"], 221340)
+        check("legacy tier2 migrated to openai_mini", snap["openai_mini_used"], 2246417)
+        check("deepseek has no legacy source, starts at 0", snap["deepseek_used"], 0)
+        with open(state) as fh:
+            rewritten = json.load(fh)
+        check("state file rewritten in the current key format", set(rewritten) >= {"openai", "openai_mini", "deepseek"}, True)
+        check("state file no longer carries the legacy keys", "tier1" in rewritten or "tier2" in rewritten, False)
+
         print("\n=== daily rollover resets counters ===")
         proc.terminate(); proc.wait(timeout=10)
         with open(state) as fh:
