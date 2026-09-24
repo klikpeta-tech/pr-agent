@@ -1,50 +1,74 @@
 #!/usr/bin/env python3
 """
-Quota-aware proxy that sits between pr-agent (litellm) and api.openai.com.
+Quota-aware proxy that sits between pr-agent (litellm) and api.openai.com,
+with an overflow lane to DeepSeek once the OpenAI "big model" grant runs out.
 
 Why this exists
 ---------------
 OpenAI's free daily grant has two buckets (see platform docs / the promo notice):
 
-  tier 1  ~250K tokens/day   gpt-5.4, gpt-5.2, gpt-5.1, gpt-5, gpt-4.1, gpt-4o, o1, o3, ...
-  tier 2  ~2.5M tokens/day   gpt-5.4-mini, gpt-5-mini, gpt-4.1-mini, o3-mini, ...
+  openai       ~250K tokens/day    gpt-5.4, gpt-5.2, gpt-5.1, gpt-5, gpt-4.1, gpt-4o, o1, o3, ...
+  openai_mini  ~2.5M tokens/day    gpt-5.4-mini, gpt-5-mini, gpt-4.1-mini, o3-mini, ...
 
 Usage past those limits is *billed*, not refused, so pr-agent's `fallback_models`
-never triggers on quota exhaustion — the primary model keeps succeeding and
+never triggers on quota exhaustion — the primary model keeps returning 200 and
 silently spends real credit. Conversely, an org-level enforced spend limit is
-all-or-nothing: once tripped it blocks every model at once, so the fallback
+all-or-nothing: once tripped it blocks every model at once, so a fallback
 can't help there either.
 
 This proxy makes the switch proactive instead of error-driven: it counts the
-tokens each response actually consumed, and once the tier-1 daily budget is
-spent it rewrites the `model` field of subsequent requests to the tier-2
-equivalent. When tier 2 is spent too it returns 429 rather than letting the
-request through to be billed.
+tokens each response actually consumed, and tracks each bucket's own daily
+budget separately, since they're genuinely separate OpenAI grants:
+
+  - `openai` exhausted -> rewrite the request to call DeepSeek instead — a
+    different upstream, a different model, and a different API key that this
+    proxy injects itself rather than forwarding from the caller (pr-agent only
+    ever holds an OpenAI key, so it couldn't authenticate to DeepSeek even if
+    it tried).
+  - `openai_mini` exhausted -> hard-stop (429), same as it always has. There is
+    no in-proxy downgrade target for it: pr-agent's own `fallback_models` list
+    already places `deepseek/deepseek-v4-flash` right after the mini model, so
+    a mini 429 becomes a genuine exception-driven fallback that pr-agent
+    resolves itself, calling DeepSeek directly with its own `[deepseek]` key —
+    outside this proxy entirely, since that request carries an explicit
+    `deepseek/` provider prefix and never touches `[openai] api_base`.
+
+DeepSeek has no free grant to protect and bills per token from the first
+call, so its budget below is a generous circuit-breaker cap against a
+metering bug driving runaway spend, not a budget to stay under — the same
+philosophy as the small non-zero OpenAI org spend limit kept as a backstop
+elsewhere (see CLAUDE.md).
 
 Wiring
 ------
 pr-agent points at this proxy via `[openai] api_base` in pr-agent-override.toml.
-The caller's Authorization header is forwarded untouched, so the proxy never
-needs its own copy of the API key.
+The caller's OpenAI Authorization header is forwarded untouched for `openai`
+and `openai_mini` calls; `deepseek` calls use this proxy's own DEEPSEEK__KEY
+instead.
 
 Environment variables
 ---------------------
-  QUOTA_PROXY_PORT        Port to listen on                  (default 3002)
-  OPENAI_UPSTREAM_BASE    Real API base                      (default https://api.openai.com)
-  QUOTA_STATE_PATH        Where the daily counters live      (default /tmp/openai-quota-state.json)
-  TIER1_DAILY_TOKENS      Tier-1 daily budget                (default 250000)
-  TIER2_DAILY_TOKENS      Tier-2 daily budget                (default 2500000)
-  QUOTA_HEADROOM          Fraction of budget actually usable (default 0.90)
-  QUOTA_TZ_OFFSET_HOURS   Hour offset for the daily reset    (default 0 = UTC midnight)
-  QUOTA_UPSTREAM_TIMEOUT  Upstream request timeout, seconds  (default 300)
-  QUOTA_DEFAULT_TIER2     Downgrade target for unmapped tier-1 models
+  QUOTA_PROXY_PORT          Port to listen on                          (default 3002)
+  OPENAI_UPSTREAM_BASE      Real OpenAI API base                       (default https://api.openai.com)
+  DEEPSEEK_UPSTREAM_BASE    Real DeepSeek API base                     (default https://api.deepseek.com)
+  DEEPSEEK__KEY             DeepSeek API key used for the overflow lane (shared with pr-agent's own [deepseek] secret)
+  QUOTA_DEEPSEEK_MODEL      Model to call once `openai` is spent       (default deepseek-v4-flash)
+  QUOTA_STATE_PATH          Where the daily counters live              (default /tmp/openai-quota-state.json)
+  OPENAI_DAILY_TOKENS       `openai` (big model) free-grant budget     (default 250000)
+  OPENAI_MINI_DAILY_TOKENS  `openai_mini` free-grant budget            (default 2500000)
+  DEEPSEEK_DAILY_TOKENS     `deepseek` circuit-breaker cap             (default 20000000)
+  QUOTA_HEADROOM            Fraction of budget actually usable         (default 0.90)
+  QUOTA_RESERVE_MIN         Minimum per-request in-flight reservation  (default 2000)
+  QUOTA_RESERVE_COMPLETION  Completion-token reservation used when the request sets no max_tokens (default 4000)
+  QUOTA_TZ_OFFSET_HOURS     Hour offset for the daily reset            (default 0 = UTC midnight)
+  QUOTA_UPSTREAM_TIMEOUT    Upstream request timeout, seconds          (default 300)
 
-  QUOTA_PRESEED_DAY       Date (YYYY-MM-DD) the preseed below applies to
-  QUOTA_PRESEED_TIER1     Tokens to treat as already spent on that day
-  QUOTA_PRESEED_TIER2     Tokens to treat as already spent on that day
+  QUOTA_PRESEED_DAY         Date (YYYY-MM-DD) the preseed below applies to
+  QUOTA_PRESEED_OPENAI      Tokens to treat as already spent on that day (falls back to the pre-rename QUOTA_PRESEED_TIER1)
+  QUOTA_PRESEED_OPENAI_MINI Tokens to treat as already spent on that day (falls back to the pre-rename QUOTA_PRESEED_TIER2)
 
 The preseed exists because the counters start at zero on a fresh deploy while
-OpenAI's real grant may already be partly spent — sending tier-1 traffic then
+OpenAI's real grant may already be partly spent — sending `openai` traffic then
 would be billed. It only applies on QUOTA_PRESEED_DAY and only when there is no
 saved state for that day, so it expires by itself at the next daily rollover.
 """
@@ -60,63 +84,55 @@ from datetime import datetime, timedelta, timezone
 
 LISTEN_PORT = int(os.environ.get("QUOTA_PROXY_PORT", "3002"))
 OPENAI_BASE = os.environ.get("OPENAI_UPSTREAM_BASE", "https://api.openai.com").rstrip("/")
+DEEPSEEK_BASE = os.environ.get("DEEPSEEK_UPSTREAM_BASE", "https://api.deepseek.com").rstrip("/")
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK__KEY", "")
+DEEPSEEK_MODEL = os.environ.get("QUOTA_DEEPSEEK_MODEL", "deepseek-v4-flash")
 STATE_PATH = os.environ.get("QUOTA_STATE_PATH", "/tmp/openai-quota-state.json")
 UPSTREAM_TIMEOUT = float(os.environ.get("QUOTA_UPSTREAM_TIMEOUT", "300"))
 TZ_OFFSET_HOURS = float(os.environ.get("QUOTA_TZ_OFFSET_HOURS", "0"))
-DEFAULT_TIER2_MODEL = os.environ.get("QUOTA_DEFAULT_TIER2", "gpt-5.4-mini")
 
 PRESEED_DAY = os.environ.get("QUOTA_PRESEED_DAY", "").strip()
 PRESEED = {
-    1: int(os.environ.get("QUOTA_PRESEED_TIER1", "0")),
-    2: int(os.environ.get("QUOTA_PRESEED_TIER2", "0")),
+    # Fall back to the pre-rename names so a deployment still exporting
+    # QUOTA_PRESEED_TIER1/TIER2 doesn't silently preseed nothing.
+    "openai": int(os.environ.get("QUOTA_PRESEED_OPENAI") or os.environ.get("QUOTA_PRESEED_TIER1", "0")),
+    "openai_mini": int(os.environ.get("QUOTA_PRESEED_OPENAI_MINI") or os.environ.get("QUOTA_PRESEED_TIER2", "0")),
 }
 
 # Only a fraction of each budget is spendable. Token cost is only known *after*
 # a response comes back, so the remainder absorbs the request that crosses the
-# line — without it a single large diff could overshoot into paid usage.
+# line — without it a single large diff could overshoot into paid usage
+# (openai), past the other free grant (openai_mini), or past the circuit
+# breaker (deepseek).
 HEADROOM = float(os.environ.get("QUOTA_HEADROOM", "0.90"))
 
-# Each in-flight request reserves an estimated cost against its tier until the
-# real usage arrives. Without a reservation, concurrent requests would all read
-# the same remaining balance, pass the check together, and collectively overshoot
-# the cap by far more than HEADROOM absorbs.
+# Each in-flight request reserves an estimated cost against its bucket until
+# the real usage arrives. Without a reservation, concurrent requests would all
+# read the same remaining balance, pass the check together, and collectively
+# overshoot the cap by far more than HEADROOM absorbs.
 RESERVE_MIN = int(os.environ.get("QUOTA_RESERVE_MIN", "2000"))
 RESERVE_COMPLETION_DEFAULT = int(os.environ.get("QUOTA_RESERVE_COMPLETION", "4000"))
 
 TIER_BUDGET = {
-    1: int(os.environ.get("TIER1_DAILY_TOKENS", "250000")),
-    2: int(os.environ.get("TIER2_DAILY_TOKENS", "2500000")),
+    "openai": int(os.environ.get("OPENAI_DAILY_TOKENS", "250000")),
+    "openai_mini": int(os.environ.get("OPENAI_MINI_DAILY_TOKENS", "2500000")),
+    "deepseek": int(os.environ.get("DEEPSEEK_DAILY_TOKENS", "20000000")),
 }
 TIER_SPENDABLE = {tier: int(budget * HEADROOM) for tier, budget in TIER_BUDGET.items()}
 
-TIER1_MODELS = frozenset(
+OPENAI_MODELS = frozenset(
     [
         "gpt-5.4", "gpt-5.2", "gpt-5.1", "gpt-5.1-codex", "gpt-5",
         "gpt-5-codex", "gpt-5-chat-latest", "gpt-4.1", "gpt-4o", "o1", "o3",
     ]
 )
-TIER2_MODELS = frozenset(
+OPENAI_MINI_MODELS = frozenset(
     [
         "gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.1-codex-mini", "gpt-5-mini",
         "gpt-5-nano", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-4o-mini",
         "o1-mini", "o3-mini", "o4-mini", "codex-mini-latest",
     ]
 )
-
-# Tier-1 model -> its closest tier-2 sibling.
-DOWNGRADE = {
-    "gpt-5.4": "gpt-5.4-mini",
-    "gpt-5.2": "gpt-5.4-mini",
-    "gpt-5.1": "gpt-5-mini",
-    "gpt-5": "gpt-5-mini",
-    "gpt-5-chat-latest": "gpt-5-mini",
-    "gpt-5-codex": "gpt-5.1-codex-mini",
-    "gpt-5.1-codex": "gpt-5.1-codex-mini",
-    "gpt-4.1": "gpt-4.1-mini",
-    "gpt-4o": "gpt-4o-mini",
-    "o1": "o1-mini",
-    "o3": "o3-mini",
-}
 
 _DATE_SUFFIX = re.compile(r"-\d{4}-\d{2}-\d{2}$")
 
@@ -127,13 +143,20 @@ def normalize_model(name: str) -> str:
     return _DATE_SUFFIX.sub("", base)
 
 
-def classify(name: str) -> int | None:
-    """Return 1, 2, or None when the model isn't part of a free-tier bucket."""
+def classify(name: str) -> str | None:
+    """Return 'openai', 'openai_mini', or None when the model isn't tracked.
+
+    There's no such thing as a direct 'deepseek' *request* from the caller's
+    side: that bucket is only ever reached by this proxy downgrading an
+    'openai' request once its budget is spent, never by the caller asking for
+    it by name (a literal `deepseek/...` request bypasses this proxy's
+    `[openai] api_base` entirely and never reaches here).
+    """
     norm = normalize_model(name)
-    if norm in TIER2_MODELS:  # checked first: 'gpt-5.4-mini' also prefixes 'gpt-5.4'
-        return 2
-    if norm in TIER1_MODELS:
-        return 1
+    if norm in OPENAI_MINI_MODELS:  # checked first: 'gpt-5.4-mini' also prefixes 'gpt-5.4'
+        return "openai_mini"
+    if norm in OPENAI_MODELS:
+        return "openai"
     return None
 
 
@@ -168,27 +191,38 @@ class QuotaState:
     state with no meaning across a restart.
     """
 
+    TIERS = ("openai", "openai_mini", "deepseek")
+    # Pre-rewrite state files (still possibly sitting on the persistent volume
+    # from before the openai/openai_mini/deepseek bucket rename) used these
+    # key names. Without this mapping, `_load()` would silently read a
+    # same-day legacy file as all-zero (a real free-grant budget the day had
+    # actually already spent), letting a proxy that believes it has a full
+    # budget send real OpenAI overage as "as_is" traffic. There is no legacy
+    # equivalent for `deepseek` — that bucket didn't exist before the rename.
+    _LEGACY_TIER_KEYS = {"openai": "tier1", "openai_mini": "tier2"}
+
     def __init__(self, path: str):
         self.path = path
         self._lock = threading.Lock()
         self._day = current_day()
-        self._used = {1: 0, 2: 0}
-        self._reserved = {1: 0, 2: 0}
+        self._used = {t: 0 for t in self.TIERS}
+        self._reserved = {t: 0 for t in self.TIERS}
         self._load()
 
-    def _committed_locked(self, tier: int) -> int:
+    def _committed_locked(self, tier: str) -> int:
         return self._used[tier] + self._reserved[tier]
 
     def _apply_preseed(self) -> None:
         """Treat part of today's grant as already spent (see QUOTA_PRESEED_DAY)."""
         if not PRESEED_DAY or PRESEED_DAY != self._day:
             return
-        if not (PRESEED[1] or PRESEED[2]):
+        if not any(PRESEED.values()):
             return
-        self._used = {1: PRESEED[1], 2: PRESEED[2]}
+        self._used["openai"] = PRESEED["openai"]
+        self._used["openai_mini"] = PRESEED["openai_mini"]
         print(
             f"[quota] Preseeded {self._day} as already spent:"
-            f" tier1={self._used[1]:,} tier2={self._used[2]:,}",
+            f" openai={self._used['openai']:,} openai_mini={self._used['openai_mini']:,}",
             flush=True,
         )
 
@@ -211,14 +245,32 @@ class QuotaState:
             )
             self._apply_preseed()
             return
-        self._used = {1: int(data.get("tier1", 0)), 2: int(data.get("tier2", 0))}
+        migrated = []
+        for tier in self.TIERS:
+            if tier in data:
+                self._used[tier] = int(data.get(tier, 0))
+                continue
+            legacy_key = self._LEGACY_TIER_KEYS.get(tier)
+            if legacy_key is not None and legacy_key in data:
+                self._used[tier] = int(data.get(legacy_key, 0))
+                migrated.append(f"{legacy_key}->{tier}")
+            else:
+                self._used[tier] = 0
         print(
-            f"[quota] Resumed {self._day}: tier1={self._used[1]:,} tier2={self._used[2]:,}",
+            f"[quota] Resumed {self._day}: "
+            + " ".join(f"{t}={self._used[t]:,}" for t in self.TIERS),
             flush=True,
         )
+        if migrated:
+            print(
+                f"[quota] Migrated legacy state keys ({', '.join(migrated)});"
+                " rewriting state file in the current format.",
+                flush=True,
+            )
+            self._save_locked()
 
     def _save_locked(self) -> None:
-        payload = {"day": self._day, "tier1": self._used[1], "tier2": self._used[2]}
+        payload = {"day": self._day, **{t: self._used[t] for t in self.TIERS}}
         tmp = f"{self.path}.tmp"
         try:
             with open(tmp, "w") as fh:
@@ -230,21 +282,28 @@ class QuotaState:
     def _roll_day_locked(self) -> None:
         today = current_day()
         if today != self._day:
-            print(
-                f"[quota] 🔄 New day {today} — resetting"
-                f" (spent {self._used[1]:,} tier1 / {self._used[2]:,} tier2 on {self._day})",
-                flush=True,
-            )
+            spent = " ".join(f"{t}={self._used[t]:,}" for t in self.TIERS)
+            print(f"[quota] 🔄 New day {today} — resetting (spent {spent} on {self._day})", flush=True)
             self._day = today
-            self._used = {1: 0, 2: 0}
+            self._used = {t: 0 for t in self.TIERS}
             self._save_locked()
 
-    def choose_model(self, requested: str, estimate: int) -> tuple[str, int | None, str, int]:
-        """Pick the model to actually call and reserve its estimated cost.
+    def choose_model(self, requested: str, estimate: int) -> tuple[str, str | None, str, int]:
+        """Pick the model (and, implicitly, the upstream) to actually call.
 
-        Returns (model, tier_to_charge, action, reserved) where action is one of
-        'as_is', 'downgraded', 'exhausted', 'untracked'. Every non-zero
+        Returns (model, tier_to_charge, action, reserved) where action is one
+        of 'as_is', 'deepseek', 'exhausted', 'untracked'. Every non-zero
         `reserved` must be handed back to settle() exactly once.
+
+        'deepseek' means route to DEEPSEEK_BASE with DEEPSEEK_API_KEY instead
+        of OpenAI — only reachable by downgrading an exhausted 'openai'
+        request, never a direct classification. 'exhausted' covers three
+        distinct cases the caller distinguishes for logging: the openai_mini
+        budget is spent (hard stop, no downgrade target — matches the
+        pre-DeepSeek behavior), DEEPSEEK__KEY isn't configured (so attempting
+        the overflow would just 401), or DeepSeek's own circuit-breaker cap is
+        somehow spent too (vanishingly rare, and a sign something is actually
+        wrong — a retry loop, a metering bug — not routine daily exhaustion).
         """
         tier = classify(requested)
         if tier is None:
@@ -253,38 +312,43 @@ class QuotaState:
         with self._lock:
             self._roll_day_locked()
 
-            def fits(t: int) -> bool:
-                # The reservation itself has to fit, not just the balance so far;
-                # otherwise one big request slips through right at the boundary
-                # and spends past the cap.
+            def fits(t: str) -> bool:
+                # The reservation itself has to fit, not just the balance so
+                # far; otherwise one big request slips through right at the
+                # boundary and spends past the cap.
                 return self._committed_locked(t) + estimate <= TIER_SPENDABLE[t]
 
-            if tier == 1:
-                if fits(1):
-                    self._reserved[1] += estimate
-                    return requested, 1, "as_is", estimate
-                target = DOWNGRADE.get(normalize_model(requested), DEFAULT_TIER2_MODEL)
-                if fits(2):
-                    self._reserved[2] += estimate
-                    return target, 2, "downgraded", estimate
-                return target, 2, "exhausted", 0
+            if tier == "openai_mini":
+                if fits("openai_mini"):
+                    self._reserved["openai_mini"] += estimate
+                    return requested, "openai_mini", "as_is", estimate
+                # No in-proxy downgrade target for mini — pr-agent's own
+                # fallback_models list picks up from here (see module docstring).
+                return requested, "openai_mini", "exhausted", 0
 
-            if fits(2):
-                self._reserved[2] += estimate
-                return requested, 2, "as_is", estimate
-            return requested, 2, "exhausted", 0
+            # tier == "openai"
+            if fits("openai"):
+                self._reserved["openai"] += estimate
+                return requested, "openai", "as_is", estimate
+            if not DEEPSEEK_API_KEY:
+                return DEEPSEEK_MODEL, "deepseek", "exhausted", 0
+            if fits("deepseek"):
+                self._reserved["deepseek"] += estimate
+                return DEEPSEEK_MODEL, "deepseek", "deepseek", estimate
+            return DEEPSEEK_MODEL, "deepseek", "exhausted", 0
 
-    def settle(self, tier: int, reserved: int, tokens: int) -> None:
+    def settle(self, tier: str | None, reserved: int, tokens: int) -> None:
         """Release a reservation and charge what the call actually cost.
 
         A request admitted just before the daily rollover settles just after it
         and is charged to the new day. That is deliberate, not an oversight, and
-        reviewers keep flagging it: OpenAI meters a call when it completes, so
-        the completion day is the day whose grant those tokens most likely came
+        reviewers keep flagging it: usage is metered when a call completes, so
+        the completion day is the day whose budget those tokens most likely came
         out of. Charging the admission day instead would leave today's counter
-        understating what today's grant has really spent — and undercounting is
-        the direction that ends in a bill. The cost of this choice is bounded by
-        one in-flight request per day, spent conservatively.
+        understating what today's budget has really spent — and undercounting is
+        the direction that ends in a bill (openai / openai_mini) or hides real
+        spend (deepseek). The cost of this choice is bounded by one in-flight
+        request per day, spent conservatively.
         """
         if not tier:
             return
@@ -300,18 +364,14 @@ class QuotaState:
 
     def snapshot(self) -> dict:
         with self._lock:
-            return {
-                "day": self._day,
-                "tier1_used": self._used[1],
-                "tier2_used": self._used[2],
-                "tier1_reserved": self._reserved[1],
-                "tier2_reserved": self._reserved[2],
-                "tier1_spendable": TIER_SPENDABLE[1],
-                "tier2_spendable": TIER_SPENDABLE[2],
-                "tier1_budget": TIER_BUDGET[1],
-                "tier2_budget": TIER_BUDGET[2],
-                "headroom": HEADROOM,
-            }
+            out = {"day": self._day}
+            for t in self.TIERS:
+                out[f"{t}_used"] = self._used[t]
+                out[f"{t}_reserved"] = self._reserved[t]
+                out[f"{t}_spendable"] = TIER_SPENDABLE[t]
+                out[f"{t}_budget"] = TIER_BUDGET[t]
+            out["headroom"] = HEADROOM
+            return out
 
 
 STATE = QuotaState(STATE_PATH)
@@ -323,15 +383,15 @@ def _usage_line() -> str:
     def pct(used, cap):
         return f"{(100.0 * used / cap):.1f}%" if cap else "n/a"
 
-    def tier(n):
-        used, spendable = snap[f"tier{n}_used"], snap[f"tier{n}_spendable"]
-        held = snap[f"tier{n}_reserved"]
+    def tier(name):
+        used, spendable = snap[f"{name}_used"], snap[f"{name}_spendable"]
+        held = snap[f"{name}_reserved"]
         # In-flight reservations count against the budget, so show them or the
         # numbers look wrong mid-burst.
         extra = f" +{held:,} held" if held else ""
-        return f"tier{n} {used:,}/{spendable:,} ({pct(used, spendable)}){extra}"
+        return f"{name} {used:,}/{spendable:,} ({pct(used, spendable)}){extra}"
 
-    return f"{tier(1)} | {tier(2)}"
+    return " | ".join(tier(t) for t in STATE.TIERS)
 
 
 def extract_stream_tokens(raw: bytes) -> int:
@@ -362,7 +422,11 @@ def extract_stream_tokens(raw: bytes) -> int:
 
 
 def extract_total_tokens(payload: dict) -> int:
-    """Read a token count from a chat/completions (or Responses API) body."""
+    """Read a token count from a chat/completions (or Responses API) body.
+
+    DeepSeek's API mirrors this same OpenAI-compatible `usage` shape, so no
+    provider-specific handling is needed here.
+    """
     usage = payload.get("usage")
     if not isinstance(usage, dict):
         return 0
@@ -404,11 +468,21 @@ class _QuotaHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _forward(self, method: str, body: bytes | None) -> tuple[int, bytes, list[tuple[str, str]]]:
-        url = OPENAI_BASE + self.path
+    def _forward(
+        self,
+        method: str,
+        body: bytes | None,
+        base: str = OPENAI_BASE,
+        auth_header: str | None = None,
+    ) -> tuple[int, bytes, list[tuple[str, str]]]:
+        url = base + self.path
         headers = {
             k: v for k, v in self.headers.items() if k.lower() not in _STRIPPED
         }
+        if auth_header is not None:
+            # Deepseek calls use this proxy's own key, not whatever the caller
+            # sent — the caller only ever holds an OpenAI key.
+            headers["Authorization"] = auth_header
         if body is not None:
             headers["Content-Length"] = str(len(body))
         req = urllib.request.Request(url, data=body, headers=headers, method=method)
@@ -418,12 +492,12 @@ class _QuotaHandler(http.server.BaseHTTPRequestHandler):
         except urllib.error.HTTPError as exc:
             return exc.code, exc.read(), list(exc.headers.items())
         except (urllib.error.URLError, OSError) as exc:
-            # DNS failure, refused connection or read timeout reaching OpenAI.
+            # DNS failure, refused connection or read timeout reaching upstream.
             # Answer with a real 503 rather than letting this escape the handler,
             # which would drop the connection and leave litellm with a transport
             # error instead of a status code.
             reason = getattr(exc, "reason", exc)
-            print(f"[quota] ❌ upstream unreachable for {method} {self.path}: {reason}", flush=True)
+            print(f"[quota] ❌ upstream unreachable for {method} {self.path} ({base}): {reason}", flush=True)
             body_out = json.dumps(
                 {
                     "error": {
@@ -498,36 +572,47 @@ class _QuotaHandler(http.server.BaseHTTPRequestHandler):
         model, tier, action, reserved = STATE.choose_model(requested, estimate)
 
         if action == "exhausted":
-            print(
-                f"[quota] 🛑 Both free tiers spent — refusing {requested}. {_usage_line()}",
-                flush=True,
-            )
+            if tier == "openai_mini":
+                reason = "openai_mini free-tier budget is spent"
+            elif not DEEPSEEK_API_KEY:
+                reason = "DEEPSEEK__KEY is not set, cannot fall back to DeepSeek"
+            else:
+                reason = "deepseek circuit-breaker cap spent"
+            print(f"[quota] 🛑 {reason} — refusing {requested}. {_usage_line()}", flush=True)
             error = {
                 "error": {
                     "message": (
-                        "openai-quota-proxy: daily free-tier token budget is spent"
-                        f" ({_usage_line()}). Refusing the request so it isn't billed"
-                        " as paid usage. Budgets reset at the next daily rollover."
+                        f"openai-quota-proxy: {reason} ({_usage_line()})."
+                        " Refusing the request so it isn't billed or spent as"
+                        " unbounded overage. Budgets reset at the next daily"
+                        " rollover."
                     ),
                     "type": "rate_limit_error",
                     "code": "free_tier_daily_budget_exhausted",
                 }
             }
-            # 429 maps to litellm.RateLimitError, which pr-agent surfaces without
-            # burning its retry budget.
+            # 429 maps to litellm.RateLimitError, which pr-agent surfaces
+            # without burning its retry budget — and, for openai_mini, lets
+            # pr-agent's own fallback_models move on to the next entry.
             self._reply(429, json.dumps(error).encode())
             return
 
-        if action == "downgraded":
-            print(f"[quota] ⬇️  tier1 spent — {requested} → {model}. {_usage_line()}", flush=True)
+        target_base = OPENAI_BASE
+        auth_header = None
+        if action == "deepseek":
+            print(f"[quota] ⬇️  openai spent — {requested} → {model} (DeepSeek). {_usage_line()}", flush=True)
             payload["model"] = model
             body = json.dumps(payload).encode()
+            target_base = DEEPSEEK_BASE
+            auth_header = f"Bearer {DEEPSEEK_API_KEY}"
         elif action == "untracked":
             print(f"[quota] ❔ {requested} is not a known free-tier model — passing through.", flush=True)
 
         tokens = 0
         try:
-            status, resp_body, headers = self._forward("POST", body)
+            status, resp_body, headers = self._forward(
+                "POST", body, base=target_base, auth_header=auth_header
+            )
             if status == 200:
                 content_type = next(
                     (v for k, v in headers if k.lower() == "content-type"), ""
@@ -548,8 +633,9 @@ class _QuotaHandler(http.server.BaseHTTPRequestHandler):
                     # doesn't say how many, charge the pre-flight estimate rather
                     # than let it through free: otherwise a stream sent without
                     # stream_options.include_usage never moves the counters, and
-                    # repeating it would walk straight past both daily caps.
-                    # Over-charging only under-uses the grant; under-charging bills.
+                    # repeating it would walk straight past the daily caps.
+                    # Over-charging only under-uses the budget; under-charging
+                    # bills (openai / openai_mini) or hides real spend (deepseek).
                     tokens = estimate
                     why = "streamed with no usage chunk" if streamed else "reported no usage"
                     print(
@@ -559,8 +645,9 @@ class _QuotaHandler(http.server.BaseHTTPRequestHandler):
                         flush=True,
                     )
             else:
-                # Errors aren't metered (OpenAI doesn't bill them), but they must be
-                # visible — this is how a block like an org spend limit shows up.
+                # Errors aren't metered (neither provider bills them), but they
+                # must be visible — this is how a block like an org spend limit
+                # or an invalid DeepSeek key shows up.
                 detail = resp_body[:300].decode(errors="replace")
                 print(f"[quota] ⚠️  upstream HTTP {status} for {model}: {detail}", flush=True)
         finally:
@@ -574,10 +661,14 @@ class _QuotaHandler(http.server.BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     print(
-        f"[quota] Listening on 127.0.0.1:{LISTEN_PORT} → {OPENAI_BASE}\n"
-        f"[quota] Budgets: tier1 {TIER_BUDGET[1]:,} tier2 {TIER_BUDGET[2]:,}"
-        f" (headroom {HEADROOM:.0%} → spendable {TIER_SPENDABLE[1]:,}/{TIER_SPENDABLE[2]:,})\n"
-        f"[quota] State file: {STATE_PATH}",
+        f"[quota] Listening on 127.0.0.1:{LISTEN_PORT} → {OPENAI_BASE}"
+        f" (deepseek overflow → {DEEPSEEK_BASE}, model={DEEPSEEK_MODEL},"
+        f" key {'set' if DEEPSEEK_API_KEY else 'MISSING'})\n"
+        f"[quota] Budgets: "
+        + " ".join(f"{t}={TIER_BUDGET[t]:,}" for t in STATE.TIERS)
+        + f" (headroom {HEADROOM:.0%} → spendable "
+        + "/".join(str(TIER_SPENDABLE[t]) for t in STATE.TIERS)
+        + f")\n[quota] State file: {STATE_PATH}",
         flush=True,
     )
     http.server.ThreadingHTTPServer(("127.0.0.1", LISTEN_PORT), _QuotaHandler).serve_forever()

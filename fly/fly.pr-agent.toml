@@ -25,6 +25,26 @@ primary_region = 'sin'
   min_machines_running = 0
   processes = ['app']
 
+  # entrypoint.sh only detects a process dying (kill -0), not one that's alive
+  # but wedged — e.g. stuck on a slow/hanging upstream call. That happened for
+  # real on 2026-09-24: pr-agent stopped answering requests entirely while Fly
+  # still reported the machine as "started", and nothing restarted it until a
+  # manual `fly apps restart`. This check goes through the same path real
+  # traffic takes (auto-approve-proxy on :3000 forwards GET / straight through
+  # to pr-agent on :3001), so it catches pr-agent hanging, not just this
+  # proxy. Fly's own platform health checks are separate from the http_service
+  # idle-connection tracking that drives auto_stop_machines, so this should
+  # not prevent the app from suspending when genuinely idle — verify that
+  # after deploying (wait for idle, `fly status` should still show
+  # "suspended", not stuck at "started").
+  [[http_service.checks]]
+    interval = '30s'
+    timeout = '10s'
+    grace_period = '15s'
+    method = 'GET'
+    path = '/'
+    protocol = 'http'
+
 [[vm]]
   memory = '512mb'
   cpu_kind = 'shared'

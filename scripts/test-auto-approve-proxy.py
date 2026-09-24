@@ -4,9 +4,11 @@ Tests the clean-review detection in fly/auto-approve-proxy.py.
 
 Run with:  python scripts/test-auto-approve-proxy.py
 
-No dependencies and no network access. The fixtures are real comment bodies
-captured from klikpeta-tech/pr-agent#2 — a review with findings and the same
-persistent comment after the findings were fixed.
+No dependencies and no network access. The fixtures are real comment bodies:
+CLEAN and WITH_FINDINGS from klikpeta-tech/pr-agent#2 (a review with findings
+and the same persistent comment after the findings were fixed), and
+CLEAN_NO_FINDINGS_ROW from klikpeta-tech/bdf-dbt#1 (a review where the model
+returned no findings at all, which renders as a structurally different row).
 
 This logic decides whether the app submits an APPROVE that counts toward branch
 protection, so a wrong "clean" verdict is the expensive direction: it approves a
@@ -49,6 +51,22 @@ Here are some key observations to aid the review process:
 </table>
 """
 
+# Real body of a review where the model returned no findings at all — a
+# structurally different clean shape than CLEAN above (captured from
+# klikpeta-tech/bdf-dbt#1, comment 5790645315): pr-agent renders a dedicated
+# "No major issues detected" row instead of an empty focus-areas cell.
+CLEAN_NO_FINDINGS_ROW = """## PR Reviewer Guide 🔍
+
+Here are some key observations to aid the review process:
+
+<table>
+<tr><td>⏱️&nbsp;<strong>Estimated effort to review</strong>: 4 🔵🔵🔵🔵⚪</td></tr>
+<tr><td>🧪&nbsp;<strong>PR contains tests</strong></td></tr>
+<tr><td>🔒&nbsp;<strong>No security concerns identified</strong></td></tr>
+<tr><td>⚡&nbsp;<strong>No major issues detected</strong></td></tr>
+</table>
+"""
+
 # Real body of the same review while it still had two findings.
 WITH_FINDINGS = """## PR Reviewer Guide 🔍
 
@@ -84,13 +102,40 @@ charged to the new day.
 </table>
 """
 
+# A review with a real finding whose quoted content happens to include the
+# exact no-issues-row markup verbatim — realistic for this repo specifically,
+# since a review of auto-approve-proxy.py's own diff could easily quote this
+# string as an example. Must not short-circuit to "clean": the finding, and
+# the "Recommended focus areas" heading it lives under, are real.
+QUOTED_NO_ISSUES_MARKUP_INSIDE_FINDING = """## PR Reviewer Guide 🔍
+
+<table>
+<tr><td>⚡&nbsp;<strong>Recommended focus areas for review</strong><br><br>
+
+<details><summary><strong>False approval risk</strong></a>
+
+If a finding's own quoted text contains
+<td>⚡&nbsp;<strong>No major issues detected</strong></td>
+verbatim, a naive substring search would misclassify this review as clean.
+</summary></details>
+
+</td></tr>
+</table>
+"""
+
 spec = importlib.util.spec_from_file_location("aap", PROXY_SRC)
 aap = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(aap)
 
 print("=== real captured review bodies ===")
 check("clean review (empty focus cell) is clean", aap.review_is_clean(CLEAN), True)
+check("clean review (no-findings row) is clean", aap.review_is_clean(CLEAN_NO_FINDINGS_ROW), True)
 check("review with 2 findings is not clean", aap.review_is_clean(WITH_FINDINGS), False)
+check(
+    "no-issues markup quoted inside a real finding is not clean",
+    aap.review_is_clean(QUOTED_NO_ISSUES_MARKUP_INSIDE_FINDING),
+    False,
+)
 
 print("\n=== a single finding must still block ===")
 one_finding = CLEAN.replace(

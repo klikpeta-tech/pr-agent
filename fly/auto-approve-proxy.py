@@ -46,15 +46,24 @@ BOT_PAT = os.environ.get("GITHUB__BOT_PAT", "")
 # /describe or /improve bot comments.
 REVIEW_COMMENT_MARKER = "PR Reviewer Guide"
 
-# pr-agent lists each finding inside this table cell, and when there are none it
-# drops the section's contents entirely (it pops `key_issues_to_review`), leaving
-# the cell empty. An empty cell is therefore the only reliable "clean review"
-# signal available in the rendered comment.
+# pr-agent renders a clean `key_issues_to_review` in one of two distinct shapes
+# (confirmed by reading pr_agent/algo/utils.py in the pragent/pr-agent:latest
+# image, around the `is_value_no(value)` branch):
 #
-# This used to look for the prose phrase "No major issues detected", which never
-# matched: upstream only writes that string (lowercased, at that) as an internal
-# reason for *withholding* a review, never in the published body. Every review
-# therefore took the request-changes branch and no PR was ever auto-approved.
+#   1. The model returned no findings at all -> a dedicated row:
+#      <tr><td>{emoji}&nbsp;<strong>No major issues detected</strong></td></tr>
+#   2. The model returned findings that all got filtered out while rendering ->
+#      the "Recommended focus areas for review" heading stays, but its cell is
+#      left empty.
+#
+# Both require positive structural evidence, not just prose matched anywhere in
+# the body: this used to look for the bare phrase "No major issues detected",
+# which never matched because upstream only wrote that string (lowercased, at
+# that) as an internal reason for *withholding* a review, never in the
+# published comment. Every review took the request-changes branch and no PR
+# was ever auto-approved. Shape 1 above looks similar but is a different,
+# structural check (exact row markup) added back deliberately for that reason.
+NO_ISSUES_ROW_RE = re.compile(r"<td>[^<]*<strong>No major issues detected</strong></td>")
 FOCUS_AREAS_HEADING = "Recommended focus areas for review"
 # Pin to the exact bot login so a different GitHub App can't spoof the trigger.
 PR_AGENT_BOT_LOGIN = os.environ.get("PR_AGENT_BOT_LOGIN", "klikpeta-pr-agent[bot]")
@@ -173,18 +182,30 @@ def _request_changes(
 
 
 def review_is_clean(body: str) -> bool:
-    """True only when the review's focus-areas cell is present and empty.
+    """True only when pr-agent's rendered markup shows positive evidence of zero findings.
 
     Deliberately requires positive evidence of a clean review rather than just
     the absence of a finding marker. If pr-agent's markup ever changes shape,
-    the cell will contain something unrecognised, this returns False, and the
-    caller requests changes — the safe direction. Guessing "clean" wrong would
+    neither check below will match, this returns False, and the caller
+    requests changes — the safe direction. Guessing "clean" wrong would
     auto-approve a PR that has real findings, and these approvals count toward
     branch protection.
     """
     start = body.find(FOCUS_AREAS_HEADING)
+
+    # Shape 1 only counts when the "Recommended focus areas" heading is absent
+    # entirely — pr-agent's renderer emits one shape or the other, never both,
+    # so a real review with findings always carries that heading. Requiring
+    # its absence here means a finding that happens to quote the no-issues
+    # row's exact markup (e.g. discussing this very file, as a review of this
+    # file's own diff realistically could) can't trigger a false approval:
+    # the heading from the review's actual findings section still short-
+    # circuits it to the "not clean" path below.
+    if start == -1 and NO_ISSUES_ROW_RE.search(body):
+        return True
+
     if start == -1:
-        return False  # section missing entirely: can't tell, so assume not clean
+        return False  # neither shape present: can't tell, so assume not clean
     start += len(FOCUS_AREAS_HEADING)
     end = body.find("</td>", start)
     if end == -1:
