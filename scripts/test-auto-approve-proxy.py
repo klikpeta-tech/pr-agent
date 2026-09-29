@@ -180,6 +180,199 @@ for label, cell in [
 print("\n=== the old trigger constant is gone ===")
 check("APPROVAL_TRIGGER removed", hasattr(aap, "APPROVAL_TRIGGER"), False)
 
+# ── webhook handling over real HTTP ─────────────────────────────────────────
+# Regression cover for 2026-09-29: pr-agent was slow to answer, GitHub gave up
+# after 10s ("context deadline exceeded ... awaiting headers"), and because the
+# approve/request-changes decision ran only after writing pr-agent's reply back,
+# the dropped connection skipped it and the PR never got a verdict.
+print("\n=== webhook: acknowledged fast, decision independent of pr-agent ===")
+
+import hashlib
+import hmac
+import http.server
+import json
+import socket
+import struct
+import threading
+import time
+import urllib.request
+
+upstream_delay = [0.0]
+upstream_seen: list[tuple[str, bytes]] = []
+
+
+class FakePrAgent(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        time.sleep(upstream_delay[0])
+        upstream_seen.append((self.path, body))
+        self.send_response(200)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"{}")
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+
+def free_port():
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def wait_for(cond, timeout=6.0):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if cond():
+            return True
+        time.sleep(0.02)
+    return cond()
+
+
+upstream_port = free_port()
+upstream_srv = http.server.ThreadingHTTPServer(("127.0.0.1", upstream_port), FakePrAgent)
+threading.Thread(target=upstream_srv.serve_forever, daemon=True).start()
+aap.UPSTREAM = f"http://127.0.0.1:{upstream_port}"
+aap.UPSTREAM_PORT = upstream_port
+aap.WEBHOOK_SECRET = b"test-secret"
+aap.FORWARD_RETRY_DELAY = 0.05
+
+actions: list[tuple[str, dict]] = []
+aap._maybe_auto_action = lambda event, payload: actions.append((event, payload))
+
+proxy_srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), aap._ProxyHandler)
+proxy_port = proxy_srv.server_address[1]
+threading.Thread(target=proxy_srv.serve_forever, daemon=True).start()
+
+PAYLOAD = json.dumps({"action": "edited", "comment": {"id": 1}}).encode()
+
+
+def sign(body: bytes) -> str:
+    return "sha256=" + hmac.new(b"test-secret", body, hashlib.sha256).hexdigest()
+
+
+def post(body: bytes = PAYLOAD, signature: str | None = None):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{proxy_port}/api/v1/github_webhooks",
+        data=body,
+        method="POST",
+        headers={
+            "X-GitHub-Event": "issue_comment",
+            "X-Hub-Signature-256": signature or sign(body),
+        },
+    )
+    start = time.monotonic()
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status, time.monotonic() - start
+    except urllib.error.HTTPError as exc:
+        return exc.code, time.monotonic() - start
+
+
+def reset():
+    upstream_seen.clear()
+    actions.clear()
+    upstream_delay[0] = 0.0
+
+
+# 1. A slow pr-agent must not hold up the reply to GitHub.
+reset()
+upstream_delay[0] = 2.0
+status, elapsed = post()
+check("slow pr-agent: webhook acknowledged with 200", status, 200)
+check("slow pr-agent: acknowledged in under 1s", elapsed < 1.0, True)
+check("slow pr-agent: decision already made at ack time", len(actions), 1)
+check("slow pr-agent: decision sees the event and payload", actions[0], ("issue_comment", json.loads(PAYLOAD)))
+check("slow pr-agent: webhook still reaches pr-agent afterwards", wait_for(lambda: len(upstream_seen) == 1), True)
+check("slow pr-agent: forwarded byte-for-byte", upstream_seen[0], ("/api/v1/github_webhooks", PAYLOAD))
+
+# 2. GitHub hanging up before it reads the reply must not skip the decision.
+reset()
+conn = socket.create_connection(("127.0.0.1", proxy_port))
+conn.sendall(
+    b"POST /api/v1/github_webhooks HTTP/1.1\r\nHost: x\r\n"
+    b"X-GitHub-Event: issue_comment\r\n"
+    + f"X-Hub-Signature-256: {sign(PAYLOAD)}\r\n".encode()
+    + f"Content-Length: {len(PAYLOAD)}\r\n\r\n".encode()
+    + PAYLOAD
+)
+# RST on close, so the proxy's write fails the way it does after a GitHub timeout.
+conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+conn.close()
+check("client hung up: decision still made", wait_for(lambda: len(actions) == 1), True)
+check("client hung up: webhook still forwarded to pr-agent", wait_for(lambda: len(upstream_seen) == 1), True)
+status, _ = post()
+check("client hung up: proxy keeps serving afterwards", status, 200)
+# Its forward is asynchronous too; let it land before the next case resets.
+wait_for(lambda: len(upstream_seen) == 2)
+
+# 3. A bad signature is rejected before anything runs.
+reset()
+status, _ = post(signature="sha256=" + "0" * 64)
+check("bad signature: 401", status, 401)
+time.sleep(0.3)
+check("bad signature: no decision", actions, [])
+check("bad signature: nothing forwarded", upstream_seen, [])
+
+# 4. An unreachable pr-agent is retried a bounded number of times, and the
+#    ack and the decision don't depend on it.
+reset()
+attempts: list[int] = []
+real_upstream_request = aap._upstream_request
+
+
+def unreachable(method, path, headers, body=None):
+    attempts.append(1)
+    return 503, b"", False
+
+
+aap._upstream_request = unreachable
+status, _ = post()
+check("pr-agent down: still acknowledged with 200", status, 200)
+check("pr-agent down: decision still made", len(actions), 1)
+check("pr-agent down: retried, then gave up", wait_for(lambda: len(attempts) == aap.FORWARD_ATTEMPTS), True)
+time.sleep(0.3)
+check("pr-agent down: no attempts beyond the limit", len(attempts), aap.FORWARD_ATTEMPTS)
+aap._upstream_request = real_upstream_request
+
+# 5. An HTTP error from pr-agent is final, not replayed.
+reset()
+attempts.clear()
+
+
+def erroring(method, path, headers, body=None):
+    attempts.append(1)
+    return 500, b"", True
+
+
+aap._upstream_request = erroring
+post()
+time.sleep(0.3)
+check("pr-agent HTTP error: not retried", len(attempts), 1)
+aap._upstream_request = real_upstream_request
+
+# 6. Health checks still go through to pr-agent, and don't traceback when the
+#    prober has already given up.
+with urllib.request.urlopen(f"http://127.0.0.1:{proxy_port}/", timeout=5) as resp:
+    check("GET / passes through to pr-agent", (resp.status, resp.read()), (200, b"ok"))
+conn = socket.create_connection(("127.0.0.1", proxy_port))
+conn.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+conn.close()
+time.sleep(0.3)
+with urllib.request.urlopen(f"http://127.0.0.1:{proxy_port}/", timeout=5) as resp:
+    check("GET / after an abandoned probe still works", resp.status, 200)
+
+proxy_srv.shutdown()
+upstream_srv.shutdown()
+
 print()
 if failures:
     print(f"{len(failures)} FAILURE(S): {failures}")

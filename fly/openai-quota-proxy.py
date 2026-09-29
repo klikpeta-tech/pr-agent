@@ -27,11 +27,22 @@ budget separately, since they're genuinely separate OpenAI grants:
     it tried).
   - `openai_mini` exhausted -> hard-stop (429), same as it always has. There is
     no in-proxy downgrade target for it: pr-agent's own `fallback_models` list
-    already places `deepseek/deepseek-v4-flash` right after the mini model, so
+    already places `openai/deepseek-v4-flash` right after the mini model, so
     a mini 429 becomes a genuine exception-driven fallback that pr-agent
-    resolves itself, calling DeepSeek directly with its own `[deepseek]` key —
-    outside this proxy entirely, since that request carries an explicit
-    `deepseek/` provider prefix and never touches `[openai] api_base`.
+    resolves itself. That entry uses the `openai/` provider prefix on purpose:
+    it makes the request go through `[openai] api_base` (this proxy), which
+    routes any `deepseek-*` model to DeepSeek as a direct request (see below).
+    A `deepseek/` prefix would instead bypass this proxy entirely, and pr-agent
+    has no way to tell DeepSeek to skip thinking mode on that path
+    (`litellm.extra_body` only accepts `processing_mode`/`service_tier`).
+
+Every request that reaches DeepSeek through this proxy — the overflow of an
+exhausted `openai` bucket, or a direct `deepseek-*` request — is sent with
+thinking mode disabled (`thinking: {"type": "disabled"}`, and any
+`reasoning_effort` pr-agent added for the original OpenAI model is dropped).
+DeepSeek defaults `deepseek-v4-flash` to thinking mode at high effort, which
+is what made reviews take minutes and time out; a review is a structured
+extraction task that doesn't need it.
 
 DeepSeek has no free grant to protect and bills per token from the first
 call, so its budget below is a generous circuit-breaker cap against a
@@ -53,6 +64,7 @@ Environment variables
   DEEPSEEK_UPSTREAM_BASE    Real DeepSeek API base                     (default https://api.deepseek.com)
   DEEPSEEK__KEY             DeepSeek API key used for the overflow lane (shared with pr-agent's own [deepseek] secret)
   QUOTA_DEEPSEEK_MODEL      Model to call once `openai` is spent       (default deepseek-v4-flash)
+  DEEPSEEK_THINKING         `disabled` (default) or `enabled`: DeepSeek thinking mode for every call this proxy sends it
   QUOTA_STATE_PATH          Where the daily counters live              (default /tmp/openai-quota-state.json)
   OPENAI_DAILY_TOKENS       `openai` (big model) free-grant budget     (default 250000)
   OPENAI_MINI_DAILY_TOKENS  `openai_mini` free-grant budget            (default 2500000)
@@ -87,6 +99,7 @@ OPENAI_BASE = os.environ.get("OPENAI_UPSTREAM_BASE", "https://api.openai.com").r
 DEEPSEEK_BASE = os.environ.get("DEEPSEEK_UPSTREAM_BASE", "https://api.deepseek.com").rstrip("/")
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK__KEY", "")
 DEEPSEEK_MODEL = os.environ.get("QUOTA_DEEPSEEK_MODEL", "deepseek-v4-flash")
+DEEPSEEK_THINKING = os.environ.get("DEEPSEEK_THINKING", "disabled").strip().lower()
 STATE_PATH = os.environ.get("QUOTA_STATE_PATH", "/tmp/openai-quota-state.json")
 UPSTREAM_TIMEOUT = float(os.environ.get("QUOTA_UPSTREAM_TIMEOUT", "300"))
 TZ_OFFSET_HOURS = float(os.environ.get("QUOTA_TZ_OFFSET_HOURS", "0"))
@@ -144,15 +157,17 @@ def normalize_model(name: str) -> str:
 
 
 def classify(name: str) -> str | None:
-    """Return 'openai', 'openai_mini', or None when the model isn't tracked.
+    """Return 'openai', 'openai_mini', 'deepseek', or None when the model isn't tracked.
 
-    There's no such thing as a direct 'deepseek' *request* from the caller's
-    side: that bucket is only ever reached by this proxy downgrading an
-    'openai' request once its budget is spent, never by the caller asking for
-    it by name (a literal `deepseek/...` request bypasses this proxy's
-    `[openai] api_base` entirely and never reaches here).
+    'deepseek' is reached two ways: this proxy downgrading an exhausted
+    'openai' request (see choose_model), or a caller asking for a `deepseek-*`
+    model by name — pr-agent's fallback entry `openai/deepseek-v4-flash` does,
+    because the `openai/` prefix routes it through this proxy. (A literal
+    `deepseek/...` model bypasses `[openai] api_base` and never reaches here.)
     """
     norm = normalize_model(name)
+    if norm.startswith("deepseek-"):
+        return "deepseek"
     if norm in OPENAI_MINI_MODELS:  # checked first: 'gpt-5.4-mini' also prefixes 'gpt-5.4'
         return "openai_mini"
     if norm in OPENAI_MODELS:
@@ -296,8 +311,9 @@ class QuotaState:
         `reserved` must be handed back to settle() exactly once.
 
         'deepseek' means route to DEEPSEEK_BASE with DEEPSEEK_API_KEY instead
-        of OpenAI — only reachable by downgrading an exhausted 'openai'
-        request, never a direct classification. 'exhausted' covers three
+        of OpenAI — reached by downgrading an exhausted 'openai' request, or
+        by a direct `deepseek-*` request (the caller's own model name, minus
+        any provider prefix, is then what DeepSeek is asked for). 'exhausted' covers three
         distinct cases the caller distinguishes for logging: the openai_mini
         budget is spent (hard stop, no downgrade target — matches the
         pre-DeepSeek behavior), DEEPSEEK__KEY isn't configured (so attempting
@@ -317,6 +333,15 @@ class QuotaState:
                 # far; otherwise one big request slips through right at the
                 # boundary and spends past the cap.
                 return self._committed_locked(t) + estimate <= TIER_SPENDABLE[t]
+
+            if tier == "deepseek":  # direct request; overflow is handled below
+                model = requested.strip().rsplit("/", 1)[-1]
+                if not DEEPSEEK_API_KEY:
+                    return model, "deepseek", "exhausted", 0
+                if fits("deepseek"):
+                    self._reserved["deepseek"] += estimate
+                    return model, "deepseek", "deepseek", estimate
+                return model, "deepseek", "exhausted", 0
 
             if tier == "openai_mini":
                 if fits("openai_mini"):
@@ -575,7 +600,7 @@ class _QuotaHandler(http.server.BaseHTTPRequestHandler):
             if tier == "openai_mini":
                 reason = "openai_mini free-tier budget is spent"
             elif not DEEPSEEK_API_KEY:
-                reason = "DEEPSEEK__KEY is not set, cannot fall back to DeepSeek"
+                reason = "DEEPSEEK__KEY is not set, cannot use DeepSeek"
             else:
                 reason = "deepseek circuit-breaker cap spent"
             print(f"[quota] 🛑 {reason} — refusing {requested}. {_usage_line()}", flush=True)
@@ -600,8 +625,17 @@ class _QuotaHandler(http.server.BaseHTTPRequestHandler):
         target_base = OPENAI_BASE
         auth_header = None
         if action == "deepseek":
-            print(f"[quota] ⬇️  openai spent — {requested} → {model} (DeepSeek). {_usage_line()}", flush=True)
+            if classify(requested) == "deepseek":
+                print(f"[quota] ➡️  {requested} → {model} (DeepSeek, direct). {_usage_line()}", flush=True)
+            else:
+                print(f"[quota] ⬇️  openai spent — {requested} → {model} (DeepSeek). {_usage_line()}", flush=True)
             payload["model"] = model
+            # DeepSeek defaults to thinking mode; turn it off. reasoning_effort
+            # is meaningless without thinking, and pr-agent adds it for the
+            # original OpenAI model, so it would otherwise leak through.
+            if DEEPSEEK_THINKING != "enabled":
+                payload["thinking"] = {"type": "disabled"}
+                payload.pop("reasoning_effort", None)
             body = json.dumps(payload).encode()
             target_base = DEEPSEEK_BASE
             auth_header = f"Bearer {DEEPSEEK_API_KEY}"

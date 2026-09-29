@@ -2,12 +2,22 @@
 """
 Reverse proxy that sits in front of pr-agent.
 
-Forwards all webhook requests to pr-agent (upstream on port 3001), then checks
+Forwards all webhook requests to pr-agent (upstream on port 3001) and checks
 whether the incoming event is an issue_comment from the pr-agent bot. Acts on
 the review result:
   - Review lists no focus areas → submits a formal GitHub PR approval.
   - Review lists at least one focus area (or its shape can't be recognised) →
     submits REQUEST_CHANGES.
+
+Webhooks are acknowledged to GitHub immediately and forwarded to pr-agent in a
+background thread. GitHub abandons a delivery after 10s, and pr-agent can take
+longer than that to answer while a review is running on this single shared vCPU
+(observed 2026-09-29: every delivery in a ~5 minute window timed out, including
+the bot's own review comment). Answering only after pr-agent did meant a slow
+reply lost the delivery, and — because the approve/request-changes decision ran
+after writing that reply — a dropped connection skipped the decision entirely.
+The decision now runs before anything is written back and does not depend on
+pr-agent's reply at all.
 
 Auth:
   All review actions (approve, request changes) use the GitHub App
@@ -28,6 +38,7 @@ import json
 import os
 import re
 import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -286,6 +297,57 @@ _HOP_BY_HOP = frozenset(
 )
 
 
+# Attempts to hand a webhook to pr-agent before giving up. Only "couldn't reach
+# it" is retried (pr-agent restarting, or a suspend/resume race); any HTTP
+# response, even an error, is final so a real failure isn't replayed.
+FORWARD_ATTEMPTS = 3
+FORWARD_RETRY_DELAY = 3.0
+
+
+def _upstream_request(
+    method: str, path: str, headers: dict[str, str], body: bytes | None = None
+) -> tuple[int, bytes, bool]:
+    """Send one request to pr-agent. Returns (status, body, reachable)."""
+    fwd_headers = {
+        k: v for k, v in headers.items()
+        if k.lower() not in _HOP_BY_HOP and k.lower() != "host"
+    }
+    if body is not None:
+        fwd_headers["Content-Length"] = str(len(body))
+    req = urllib.request.Request(UPSTREAM + path, data=body, headers=fwd_headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return resp.status, resp.read(), True
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read(), True
+    except (urllib.error.URLError, OSError) as exc:
+        # Connection refused means pr-agent isn't listening yet (or has died);
+        # OSError also covers read timeouts.
+        reason = getattr(exc, "reason", exc)
+        print(
+            f"[proxy] ❌ upstream :{UPSTREAM_PORT} unreachable for {method} {path} ({reason})",
+            flush=True,
+        )
+        return 503, b'{"error": "pr-agent upstream unavailable"}', False
+
+
+def _forward_webhook(path: str, headers: dict[str, str], body: bytes, event_type: str) -> None:
+    """Background half of a webhook: hand it to pr-agent, retrying if unreachable."""
+    for attempt in range(1, FORWARD_ATTEMPTS + 1):
+        status, _, reachable = _upstream_request("POST", path, headers, body)
+        if reachable:
+            if status >= 400:
+                print(f"[proxy] ⚠️  pr-agent answered HTTP {status} for {event_type} webhook", flush=True)
+            return
+        if attempt < FORWARD_ATTEMPTS:
+            time.sleep(FORWARD_RETRY_DELAY)
+    print(
+        f"[proxy] ❌ gave up delivering {event_type} webhook to pr-agent"
+        f" after {FORWARD_ATTEMPTS} attempts",
+        flush=True,
+    )
+
+
 class _ProxyHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # suppress default Apache-style log
         pass
@@ -297,61 +359,51 @@ class _ProxyHandler(http.server.BaseHTTPRequestHandler):
         expected = "sha256=" + hmac.new(WEBHOOK_SECRET, body, hashlib.sha256).hexdigest()
         return hmac.compare_digest(expected, sig)
 
-    def _forward(self, method: str, body: bytes | None = None) -> tuple[int, bytes]:
-        url = UPSTREAM + self.path
-        fwd_headers = {
-            k: v for k, v in self.headers.items()
-            if k.lower() not in _HOP_BY_HOP and k.lower() != "host"
-        }
-        if body is not None:
-            fwd_headers["Content-Length"] = str(len(body))
-        req = urllib.request.Request(url, data=body, headers=fwd_headers, method=method)
+    def _respond(self, status: int, body: bytes = b"") -> None:
+        """Write a response, tolerating a caller that already hung up.
+
+        A GitHub delivery that timed out (or a health probe that gave up) has
+        closed the socket by the time we answer; that is not an error worth a
+        traceback, and it must never abort the caller before it does its work.
+        """
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                return resp.status, resp.read()
-        except urllib.error.HTTPError as exc:
-            return exc.code, exc.read()
-        except (urllib.error.URLError, OSError) as exc:
-            # Connection refused means pr-agent isn't listening yet (or has died);
-            # OSError also covers read timeouts. Reply 503 instead of letting the
-            # handler raise, which would dump a traceback and drop the connection.
-            reason = getattr(exc, "reason", exc)
-            print(
-                f"[proxy] ❌ upstream :{UPSTREAM_PORT} unreachable for {method} {self.path}"
-                f" ({reason})",
-                flush=True,
-            )
-            return 503, b'{"error": "pr-agent upstream unavailable"}'
+            self.send_response(status)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
 
         if not self._verify_signature(body):
-            self.send_response(401)
-            self.end_headers()
+            self._respond(401)
             return
 
         event_type = self.headers.get("X-GitHub-Event", "")
 
-        status, resp_body = self._forward("POST", body)
-        self.send_response(status)
-        self.send_header("Content-Length", str(len(resp_body)))
-        self.end_headers()
-        self.wfile.write(resp_body)
-
-        # Inspect after forwarding (non-blocking)
+        # Decide first, answer second: this only spawns a thread, and it must
+        # not sit behind anything that can fail or block on the caller.
         try:
             _maybe_auto_action(event_type, json.loads(body))
         except Exception as exc:
             print(f"[auto-action] Error inspecting payload: {exc}", flush=True)
 
+        threading.Thread(
+            target=_forward_webhook,
+            args=(self.path, dict(self.headers.items()), body, event_type),
+            daemon=True,
+        ).start()
+        # pr-agent's own reply is just `{}`; GitHub has no use for it.
+        self._respond(200, b"{}")
+
     def do_GET(self):
-        status, resp_body = self._forward("GET")
-        self.send_response(status)
-        self.send_header("Content-Length", str(len(resp_body)))
-        self.end_headers()
-        self.wfile.write(resp_body)
+        # Health checks: this really does go through to pr-agent, so a wedged
+        # pr-agent fails the check (see entrypoint.sh / fly.pr-agent.toml).
+        status, resp_body, _ = _upstream_request("GET", self.path, dict(self.headers.items()))
+        self._respond(status, resp_body)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

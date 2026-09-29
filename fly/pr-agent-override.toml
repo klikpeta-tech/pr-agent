@@ -1,35 +1,16 @@
 [config]
 model = "gpt-5.4-2026-03-05"
-# Upstream default is 120s, sized for OpenAI. DeepSeek (deepseek-v4-flash,
-# thinking mode — now the default overflow target once `openai` is exhausted,
-# and used directly for model_weak's fallback) has been observed taking well
-# over 120s on this PR's diff. With retry_same_model_on_timeout left at its
-# default (true), a 120s timeout doesn't fail fast — it retries the same slow
-# model repeatedly, and a review can burn ~15+ minutes across retries without
-# ever completing or posting anything. Match this to the quota proxy's own
-# QUOTA_UPSTREAM_TIMEOUT (300s, see openai-quota-proxy.py) so neither side
-# gives up before the other.
+# Upstream default is 120s, sized for OpenAI. Kept at 300s to match the quota
+# proxy's own QUOTA_UPSTREAM_TIMEOUT so neither side gives up before the other.
+# This used to be needed because DeepSeek ran in thinking mode and routinely took
+# well over 120s on a large diff; the quota proxy now sends every DeepSeek call
+# with thinking disabled (see openai-quota-proxy.py), so calls should finish in
+# seconds and this is only the ceiling for a genuinely stuck one.
 ai_timeout = 300
-# DeepSeek's own API defaults deepseek-v4-flash to thinking mode at "high"
-# reasoning effort (api-docs.deepseek.com/guides/thinking_mode) — that's the
-# real source of the slow/timing-out calls, not just something to work around
-# with a longer timeout. pr-agent already has a config.reasoning_effort
-# default ("medium", see upstream configuration.toml) that would normally
-# rein this in, but it only auto-applies to models litellm's bundled metadata
-# already knows are reasoning-capable — deepseek-v4-flash is too new for
-# that, the same reason it's missing from pr-agent's own MAX_TOKENS table
-# (see custom_model_max_tokens below). additional_reasoning_effort_models is
-# the documented escape hatch for exactly this case: it makes DeepSeek
-# receive config.reasoning_effort as a real top-level `reasoning_effort`
-# kwarg (litellm forwards it; DeepSeek's own API accepts that same parameter
-# name) instead of silently falling back to DeepSeek's own high-effort
-# default.
-additional_reasoning_effort_models = ["deepseek/deepseek-v4-flash"]
 # Upstream default (true) retries the SAME model on a timeout before moving to
 # fallback_models. Since our primary `gpt-5.4` request is often transparently
-# downgraded to the slow-and-occasionally-timing-out DeepSeek overflow (see
-# openai-quota-proxy.py), a timeout there just repeats the same slow call
-# instead of failing fast — this is exactly what caused a real ~18-minute
+# downgraded to the DeepSeek overflow (see openai-quota-proxy.py), a timeout
+# there just repeats the same slow call instead of failing fast — this is exactly what caused a real ~18-minute
 # stall on 2026-09-23/24 where a push-triggered review silently never
 # completed or posted anything. false makes one timeout move straight to
 # fallback_models[0] = gpt-5.4-mini, a normally-fast real OpenAI call with
@@ -42,7 +23,7 @@ retry_same_model_on_timeout = false
 # bucket config.model uses) and hard-stops (429) once it's spent, same as it
 # always did. There's no in-proxy downgrade target for that bucket: a 429
 # here is a genuine failure pr-agent sees, so its own fallback_models list
-# below (which already lists deepseek/deepseek-v4-flash right after
+# below (which already lists openai/deepseek-v4-flash right after
 # gpt-5.4-mini) picks it up from there.
 model_weak = "gpt-5.4-mini"
 # deepseek-v4-flash isn't in pr-agent's bundled MAX_TOKENS table (only the
@@ -62,7 +43,15 @@ custom_model_max_tokens = 128000
 # for it), and is the second line of defense if the proxy itself is
 # unreachable or DeepSeek is unavailable/capped when the proxy tries it
 # internally for the openai bucket.
-fallback_models = ["gpt-5.4-mini", "deepseek/deepseek-v4-flash"]
+#
+# The DeepSeek entry is `openai/deepseek-v4-flash`, NOT `deepseek/...`, on
+# purpose. The `openai/` prefix sends it through [openai] api_base (the quota
+# proxy), which routes any deepseek-* model to DeepSeek with thinking disabled
+# and meters it in the `deepseek` bucket. `deepseek/` would call DeepSeek
+# directly with its default thinking mode (slow — minutes on a big diff), and
+# pr-agent gives no way to turn that off per model: litellm.extra_body only
+# accepts processing_mode/service_tier.
+fallback_models = ["gpt-5.4-mini", "openai/deepseek-v4-flash"]
 deployment_type = "app"
 
 [openai]

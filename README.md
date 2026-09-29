@@ -24,7 +24,7 @@ pr-agent server      (port 3001) ← internal only
 PR comments + approvals
 ```
 
-The `auto-approve-proxy.py` is a thin reverse proxy that forwards all webhook traffic to pr-agent and intercepts `issue_comment` events from the bot to trigger approvals.
+The `auto-approve-proxy.py` is a thin reverse proxy that acknowledges webhooks immediately, forwards them to pr-agent in the background, and intercepts `issue_comment` events from the bot to trigger approvals.
 
 ## Deployment
 

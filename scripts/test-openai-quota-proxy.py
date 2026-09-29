@@ -44,6 +44,8 @@ seen_models: list[str] = []
 seen_auth: list[str] = []
 seen_deepseek_models: list[str] = []
 seen_deepseek_auth: list[str] = []
+seen_bodies: list[dict] = []
+seen_deepseek_bodies: list[dict] = []
 failures: list[str] = []
 
 
@@ -60,7 +62,7 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
-def _make_fake_handler(models: list, auths: list):
+def _make_fake_handler(models: list, auths: list, bodies: list):
     """Build a fake OpenAI-compatible upstream handler that echoes back the
     model it was asked for, with a fixed token cost, recording into the given
     lists so OpenAI and DeepSeek traffic can be told apart."""
@@ -75,6 +77,7 @@ def _make_fake_handler(models: list, auths: list):
             n = int(self.headers.get("Content-Length", 0))
             req = json.loads(self.rfile.read(n))
             models.append(req.get("model"))
+            bodies.append(req)
             auths.append(self.headers.get("Authorization"))
             if RESPONSE_DELAY:
                 time.sleep(RESPONSE_DELAY)
@@ -131,8 +134,8 @@ def _make_fake_handler(models: list, auths: list):
     return FakeUpstream
 
 
-FakeOpenAI = _make_fake_handler(seen_models, seen_auth)
-FakeDeepSeek = _make_fake_handler(seen_deepseek_models, seen_deepseek_auth)
+FakeOpenAI = _make_fake_handler(seen_models, seen_auth, seen_bodies)
+FakeDeepSeek = _make_fake_handler(seen_deepseek_models, seen_deepseek_auth, seen_deepseek_bodies)
 
 
 def main() -> int:
@@ -194,11 +197,11 @@ def main() -> int:
             out, _ = proc.communicate()
         raise RuntimeError(f"proxy did not start: {out}")
 
-    def call(model="gpt-5.4-2026-03-05"):
+    def call(model="gpt-5.4-2026-03-05", **extra):
         req = urllib.request.Request(
             f"http://127.0.0.1:{proxy_port}/v1/chat/completions",
             data=json.dumps(
-                {"model": model, "messages": [{"role": "user", "content": "hi"}]}
+                {"model": model, "messages": [{"role": "user", "content": "hi"}], **extra}
             ).encode(),
             headers={
                 "Content-Type": "application/json",
@@ -238,7 +241,8 @@ def main() -> int:
     check("classify o3", qp.classify("o3"), "openai")
     check("classify o3-mini", qp.classify("o3-mini"), "openai_mini")
     check("classify unknown", qp.classify("claude-opus-5"), None)
-    check("classify deepseek is never a direct request", qp.classify("deepseek-v4-flash"), None)
+    check("classify deepseek-* is a direct deepseek request", qp.classify("deepseek-v4-flash"), "deepseek")
+    check("classify openai/-prefixed deepseek", qp.classify("openai/deepseek-v4-flash"), "deepseek")
     check("usage total_tokens", qp.extract_total_tokens({"usage": {"total_tokens": 42}}), 42)
     check(
         "usage responses shape",
@@ -280,8 +284,36 @@ def main() -> int:
         check("openai not charged for the overflow call", quota()["openai_used"], 1200)
         check("deepseek charged instead", quota()["deepseek_used"], 400)
 
+        print("\n=== deepseek is called with thinking disabled ===")
+        check(
+            "overflow request disables thinking",
+            seen_deepseek_bodies[0].get("thinking"),
+            {"type": "disabled"},
+        )
+        # pr-agent adds reasoning_effort for the original GPT-5 model; it must
+        # not leak through to DeepSeek, where it would fight thinking=disabled.
+        call(reasoning_effort="medium")
+        check(
+            "reasoning_effort dropped on the overflow call",
+            "reasoning_effort" in seen_deepseek_bodies[-1],
+            False,
+        )
+        check("thinking still disabled with reasoning_effort set", seen_deepseek_bodies[-1].get("thinking"), {"type": "disabled"})
+        check("openai request bodies are never given a thinking field", any("thinking" in b for b in seen_bodies), False)
+
+        print("\n=== direct deepseek-* request (pr-agent fallback via openai/ prefix) ===")
+        n_openai = len(seen_models)
+        status, resp = call("openai/deepseek-v4-flash")
+        check("direct deepseek status", status, 200)
+        check("direct deepseek never touches openai", len(seen_models), n_openai)
+        check("provider prefix stripped for DeepSeek", seen_deepseek_models[-1], "deepseek-v4-flash")
+        check("direct deepseek disables thinking", seen_deepseek_bodies[-1].get("thinking"), {"type": "disabled"})
+        check("direct deepseek uses the proxy's key", seen_deepseek_auth[-1], f"Bearer {FAKE_DEEPSEEK_KEY}")
+        check("direct deepseek charged to deepseek", quota()["deepseek_used"], 1200)
+        check("direct deepseek left openai_mini alone", quota()["openai_mini_used"], 0)
+
         print("\n=== deepseek circuit-breaker spent, then hard stop ===")
-        for i in range(4):  # 400 + 4*400 = 2000, reaching the deepseek cap
+        for i in range(2):  # 1200 spent above + 2*400 = 2000, reaching the deepseek cap
             status, _ = call()
             check(f"deepseek call {i+1} status", status, 200)
         check("deepseek used", quota()["deepseek_used"], 2000)
