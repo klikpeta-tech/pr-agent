@@ -1,0 +1,16 @@
+name: Require no-mistakes
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  require-no-mistakes:
+    name: PR must be raised via no-mistakes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: kunchenguid/no-mistakes/.github/actions/require-no-mistakes@12ad62fcc83caaeb094a58ef0ef0037d405888be
